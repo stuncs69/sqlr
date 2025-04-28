@@ -2,7 +2,7 @@
 
 use crate::parser::{
     BinaryOperator, CreateTableStatement, DeleteStatement, Expression, InsertStatement,
-    LiteralValue as ParserLiteralValue, ParsedDataType, Statement, UnaryOperator,
+    LiteralValue as ParserLiteralValue, ParsedDataType, Statement, UnaryOperator, UpdateStatement,
 };
 use crate::storage::{Column, DataType, Row, StorageManager, Table, Value};
 use serde::Serialize;
@@ -33,6 +33,7 @@ impl<'a> Executor<'a> {
             Statement::CreateTable(create_stmt) => self.execute_create_table(create_stmt),
             Statement::Insert(insert_stmt) => self.execute_insert(insert_stmt),
             Statement::Delete(delete_stmt) => self.execute_delete(delete_stmt),
+            Statement::Update(update_stmt) => self.execute_update(update_stmt),
         }
     }
 
@@ -43,6 +44,59 @@ impl<'a> Executor<'a> {
         let table_name = statement
             .from_table
             .ok_or_else(|| "FROM clause is required for SELECT".to_string())?;
+
+        if table_name.eq_ignore_ascii_case("SQLR_TABLES") {
+            println!("[execute_select] Handling meta-table SQLR_TABLES");
+
+            let meta_columns = vec![("name".to_string(), DataType::Text)];
+
+            let requested_col_indices: Vec<usize> = match &statement.columns[..] {
+                [crate::parser::SelectItem::Wildcard] => (0..meta_columns.len()).collect(),
+                select_items => {
+                    let mut indices = Vec::new();
+                    for item in select_items {
+                        if let crate::parser::SelectItem::UnnamedExpr(Expression::Identifier(
+                            name,
+                        )) = item
+                        {
+                            if let Some(index) = meta_columns
+                                .iter()
+                                .position(|(col_name, _)| col_name.eq_ignore_ascii_case(name))
+                            {
+                                indices.push(index);
+                            } else {
+                                return Err(format!("Unknown column '{}' in SQLR_TABLES", name));
+                            }
+                        } else {
+                            return Err("Unsupported item in SELECT list for SQLR_TABLES (only column names or *)".to_string());
+                        }
+                    }
+                    indices
+                }
+            };
+
+            let result_columns: Vec<String> = requested_col_indices
+                .iter()
+                .map(|&i| meta_columns[i].0.clone())
+                .collect();
+
+            let table_names = self.storage.list_table_names();
+            let mut result_rows: Vec<Row> = Vec::with_capacity(table_names.len());
+
+            for name in table_names {
+                let row_values = vec![Value::Text(name)];
+                let selected_row_values: Row = requested_col_indices
+                    .iter()
+                    .map(|&i| row_values[i].clone())
+                    .collect();
+                result_rows.push(selected_row_values);
+            }
+
+            return Ok(ExecutionResult::RowSet {
+                columns: result_columns,
+                rows: result_rows,
+            });
+        }
 
         let table = self
             .storage
@@ -347,7 +401,7 @@ impl<'a> Executor<'a> {
     fn execute_delete(&mut self, statement: DeleteStatement) -> Result<ExecutionResult, String> {
         let table_name = statement.table_name;
 
-        let (indices_to_delete, num_cols_check) = {
+        let indices_to_delete = {
             let table = self
                 .storage
                 .get_table(&table_name)
@@ -379,7 +433,7 @@ impl<'a> Executor<'a> {
                 );
                 indices = (0..table.rows.len()).collect();
             }
-            (indices, table.columns.len())
+            indices
         };
 
         let deleted_count = self.storage.delete_rows(&table_name, indices_to_delete)?;
@@ -387,6 +441,95 @@ impl<'a> Executor<'a> {
         Ok(ExecutionResult::Msg(format!(
             "Deleted {} row(s) from '{}'",
             deleted_count, table_name
+        )))
+    }
+
+    fn execute_update(&mut self, statement: UpdateStatement) -> Result<ExecutionResult, String> {
+        let table_name = statement.table_name;
+
+        let (indices_to_update, column_map) = {
+            let table = self
+                .storage
+                .get_table(&table_name)
+                .ok_or_else(|| format!("Table '{}' not found for UPDATE", table_name))?;
+
+            let mut indices = Vec::new();
+            if let Some(where_expr) = &statement.where_clause {
+                println!("[execute_update] Evaluating WHERE clause: {:?}", where_expr);
+                for (index, row) in table.rows.iter().enumerate() {
+                    match self.evaluate_where_condition(where_expr, table, row) {
+                        Ok(true) => indices.push(index),
+                        Ok(false) => {}
+                        Err(e) => {
+                            return Err(format!(
+                                "WHERE clause evaluation error during UPDATE: {}",
+                                e
+                            ));
+                        }
+                    }
+                }
+                println!(
+                    "[execute_update] Found {} rows matching WHERE clause",
+                    indices.len()
+                );
+            } else {
+                println!(
+                    "[execute_update] No WHERE clause, updating all rows in '{}'",
+                    table_name
+                );
+                indices = (0..table.rows.len()).collect();
+            }
+
+            let col_map: HashMap<String, usize> = table
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (c.name.clone(), i))
+                .collect();
+
+            (indices, col_map)
+        };
+
+        let mut updated_count = 0;
+        for row_index in indices_to_update {
+            let table = self
+                .storage
+                .get_table(&table_name)
+                .ok_or_else(|| format!("Table '{}' disappeared during UPDATE?", table_name))?;
+            let row = &table.rows[row_index];
+
+            let mut updates_for_row: Vec<(usize, Value)> = Vec::new();
+            for (col_name, expr) in &statement.assignments {
+                let col_index = *column_map.get(col_name).ok_or_else(|| {
+                    format!("Column '{}' not found in table '{}'", col_name, table_name)
+                })?;
+
+                let new_value = self.evaluate_expression(expr, table, row)?;
+
+                let expected_type = &table.columns[col_index].data_type;
+                match (expected_type, &new_value) {
+                    (DataType::Integer, Value::Integer(_)) => {}
+                    (DataType::Text, Value::Text(_)) => {}
+                    (_, Value::Null) => {}
+                    (dt, val) => {
+                        return Err(format!(
+                            "Type mismatch for column '{}'. Expected {:?}, got {:?}",
+                            col_name, dt, val
+                        ));
+                    }
+                }
+
+                updates_for_row.push((col_index, new_value));
+            }
+
+            self.storage
+                .update_row_values(&table_name, row_index, &updates_for_row)?;
+            updated_count += 1;
+        }
+
+        Ok(ExecutionResult::Msg(format!(
+            "Updated {} row(s) in '{}'",
+            updated_count, table_name
         )))
     }
 }
@@ -758,14 +901,19 @@ mod tests {
         let mut executor = Executor::new(&mut storage);
         execute_success(&mut executor, "CREATE TABLE stuff (id INT);");
         execute_success(&mut executor, "INSERT INTO stuff VALUES (1), (2), (3);");
+
+        drop(executor);
+
         assert_eq!(storage.get_table("stuff").unwrap().rows.len(), 3);
 
+        let mut executor = Executor::new(&mut storage);
         let result = execute_success(&mut executor, "DELETE FROM stuff;");
         if let ExecutionResult::Msg(msg) = result {
             assert!(msg.contains("Deleted 3 row(s)"));
         } else {
             panic!();
         }
+        drop(executor);
         assert_eq!(storage.get_table("stuff").unwrap().rows.len(), 0);
     }
 
@@ -778,8 +926,11 @@ mod tests {
             &mut executor,
             "INSERT INTO data VALUES (1, 'A'), (2, 'B'), (3, 'A'), (4, 'C');",
         );
+        drop(executor);
+
         assert_eq!(storage.get_table("data").unwrap().rows.len(), 4);
 
+        let mut executor = Executor::new(&mut storage);
         let result = execute_success(
             &mut executor,
             "DELETE FROM data WHERE city = 'A' OR id = 4;",
@@ -790,6 +941,8 @@ mod tests {
             panic!();
         }
 
+        drop(executor);
+        let mut executor = Executor::new(&mut storage);
         let remaining = execute_success(&mut executor, "SELECT * FROM data;");
         if let ExecutionResult::RowSet { rows, .. } = remaining {
             assert_eq!(rows.len(), 1);
@@ -806,5 +959,205 @@ mod tests {
         let mut executor = Executor::new(&mut storage);
         let error_msg = execute_fail(&mut executor, "DELETE FROM missing_table WHERE id = 1;");
         assert!(error_msg.contains("Table 'missing_table' not found"));
+    }
+
+    #[test]
+    fn test_execute_update_simple() {
+        let mut storage = StorageManager::new();
+        let mut executor = Executor::new(&mut storage);
+        execute_success(
+            &mut executor,
+            "CREATE TABLE users (id INT, email TEXT, status INT);",
+        );
+        execute_success(
+            &mut executor,
+            "INSERT INTO users VALUES (1, 'a@a.com', 0), (2, 'b@b.com', 0), (3, 'c@c.com', 0);",
+        );
+
+        let result = execute_success(&mut executor, "UPDATE users SET status = 1 WHERE id = 2;");
+        if let ExecutionResult::Msg(msg) = result {
+            assert!(msg.contains("Updated 1 row(s)"), "Got: {}", msg);
+        } else {
+            panic!("Expected Msg result");
+        }
+
+        let select_result =
+            execute_success(&mut executor, "SELECT status FROM users WHERE id = 2;");
+        if let ExecutionResult::RowSet { rows, .. } = select_result {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][0], Value::Integer(1));
+        } else {
+            panic!("Expected RowSet result");
+        }
+
+        let select_result_other =
+            execute_success(&mut executor, "SELECT status FROM users WHERE id = 1;");
+        if let ExecutionResult::RowSet { rows, .. } = select_result_other {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][0], Value::Integer(0));
+        } else {
+            panic!("Expected RowSet result");
+        }
+    }
+
+    #[test]
+    fn test_execute_update_multiple_set() {
+        let mut storage = StorageManager::new();
+        let mut executor = Executor::new(&mut storage);
+        execute_success(
+            &mut executor,
+            "CREATE TABLE users (id INT, email TEXT, status INT);",
+        );
+        execute_success(&mut executor, "INSERT INTO users VALUES (1, 'a@a.com', 0);");
+
+        execute_success(
+            &mut executor,
+            "UPDATE users SET status = 5, email = 'new@new.com' WHERE id = 1;",
+        );
+
+        let select_result = execute_success(
+            &mut executor,
+            "SELECT email, status FROM users WHERE id = 1;",
+        );
+        if let ExecutionResult::RowSet { rows, .. } = select_result {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][0], Value::Text("new@new.com".to_string()));
+            assert_eq!(rows[0][1], Value::Integer(5));
+        } else {
+            panic!("Expected RowSet result");
+        }
+    }
+
+    #[test]
+    fn test_execute_update_no_where() {
+        let mut storage = StorageManager::new();
+        let mut executor = Executor::new(&mut storage);
+        execute_success(&mut executor, "CREATE TABLE data (val INT);");
+        execute_success(&mut executor, "INSERT INTO data VALUES (1), (2), (3);");
+
+        let result = execute_success(&mut executor, "UPDATE data SET val = 99;");
+        if let ExecutionResult::Msg(msg) = result {
+            assert!(msg.contains("Updated 3 row(s)"), "Got: {}", msg);
+        } else {
+            panic!("Expected Msg result");
+        }
+
+        let select_result = execute_success(&mut executor, "SELECT val FROM data;");
+        if let ExecutionResult::RowSet { rows, .. } = select_result {
+            assert_eq!(rows.len(), 3);
+            assert_eq!(rows[0][0], Value::Integer(99));
+            assert_eq!(rows[1][0], Value::Integer(99));
+            assert_eq!(rows[2][0], Value::Integer(99));
+        } else {
+            panic!("Expected RowSet result");
+        }
+    }
+
+    #[test]
+    fn test_execute_update_nonexistent_table() {
+        let mut storage = StorageManager::new();
+        let mut executor = Executor::new(&mut storage);
+        let error = execute_fail(&mut executor, "UPDATE nonexist SET col = 1;");
+        assert!(error.contains("Table 'nonexist' not found"));
+    }
+
+    #[test]
+    fn test_execute_update_nonexistent_column_set() {
+        let mut storage = StorageManager::new();
+        let mut executor = Executor::new(&mut storage);
+        execute_success(&mut executor, "CREATE TABLE data (id INT);");
+        execute_success(&mut executor, "INSERT INTO data VALUES (1);");
+        let error = execute_fail(&mut executor, "UPDATE data SET nonexist_col = 1;");
+        assert!(error.contains("Column 'nonexist_col' not found"));
+    }
+
+    #[test]
+    fn test_execute_update_nonexistent_column_where() {
+        let mut storage = StorageManager::new();
+        let mut executor = Executor::new(&mut storage);
+        execute_success(&mut executor, "CREATE TABLE data (id INT);");
+        execute_success(&mut executor, "INSERT INTO data VALUES (1);");
+        let error = execute_fail(
+            &mut executor,
+            "UPDATE data SET id = 2 WHERE nonexist_col = 1;",
+        );
+        assert!(error.contains("Column 'nonexist_col' not found during evaluation"));
+    }
+
+    #[test]
+    fn test_execute_update_type_mismatch() {
+        let mut storage = StorageManager::new();
+        let mut executor = Executor::new(&mut storage);
+        execute_success(&mut executor, "CREATE TABLE data (id INT, name TEXT);");
+        execute_success(&mut executor, "INSERT INTO data VALUES (1, 'one');");
+        let error = execute_fail(
+            &mut executor,
+            "UPDATE data SET id = 'two' WHERE name = 'one';",
+        );
+        assert!(error.contains("Type mismatch for column 'id'"));
+    }
+
+    #[test]
+    fn test_select_from_sqlr_tables() {
+        let mut storage = StorageManager::new();
+        let mut executor = Executor::new(&mut storage);
+        execute_success(&mut executor, "CREATE TABLE users (id INT);");
+        execute_success(&mut executor, "CREATE TABLE products (name TEXT);");
+
+        let result_star = execute_success(&mut executor, "SELECT * FROM SQLR_TABLES;");
+        if let ExecutionResult::RowSet { columns, rows } = result_star {
+            assert_eq!(columns, vec!["name"]);
+            assert_eq!(rows.len(), 2);
+            let names: std::collections::HashSet<String> = rows
+                .into_iter()
+                .map(|row| match row[0] {
+                    Value::Text(ref s) => s.clone(),
+                    _ => panic!("Expected Text value"),
+                })
+                .collect();
+            assert!(names.contains("users"));
+            assert!(names.contains("products"));
+        } else {
+            panic!("Expected RowSet result for SQLR_TABLES (*)");
+        }
+
+        let result_name = execute_success(&mut executor, "SELECT name FROM SQLR_TABLES;");
+        if let ExecutionResult::RowSet { columns, rows } = result_name {
+            assert_eq!(columns, vec!["name"]);
+            assert_eq!(rows.len(), 2);
+            let names: std::collections::HashSet<String> = rows
+                .into_iter()
+                .map(|row| match row[0] {
+                    Value::Text(ref s) => s.clone(),
+                    _ => panic!("Expected Text value"),
+                })
+                .collect();
+            assert!(names.contains("users"));
+            assert!(names.contains("products"));
+        } else {
+            panic!("Expected RowSet result for SQLR_TABLES (name)");
+        }
+    }
+
+    #[test]
+    fn test_select_from_sqlr_tables_empty() {
+        let mut storage = StorageManager::new();
+        let mut executor = Executor::new(&mut storage);
+        let result = execute_success(&mut executor, "SELECT name FROM SQLR_TABLES;");
+        if let ExecutionResult::RowSet { columns, rows } = result {
+            assert_eq!(columns, vec!["name"]);
+            assert_eq!(rows.len(), 0);
+        } else {
+            panic!("Expected RowSet result for empty SQLR_TABLES");
+        }
+    }
+
+    #[test]
+    fn test_select_unknown_column_sqlr_tables() {
+        let mut storage = StorageManager::new();
+        let mut executor = Executor::new(&mut storage);
+        execute_success(&mut executor, "CREATE TABLE users (id INT);");
+        let error = execute_fail(&mut executor, "SELECT non_existent_col FROM SQLR_TABLES;");
+        assert!(error.contains("Unknown column 'non_existent_col' in SQLR_TABLES"));
     }
 }

@@ -35,6 +35,9 @@ pub enum Token {
     Is,
     Null,
     Delete,
+
+    Update,
+    Set,
 }
 
 pub struct Lexer<'a> {
@@ -139,6 +142,8 @@ impl<'a> Lexer<'a> {
             "IS" => Token::Is,
             "NULL" => Token::Null,
             "DELETE" => Token::Delete,
+            "UPDATE" => Token::Update,
+            "SET" => Token::Set,
             _ => Token::Identifier(ident.to_string()),
         }
     }
@@ -360,6 +365,7 @@ pub enum Statement {
     CreateTable(CreateTableStatement),
     Insert(InsertStatement),
     Delete(DeleteStatement),
+    Update(UpdateStatement),
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -468,6 +474,7 @@ impl<'a> Parser<'a> {
             Token::Create => self.parse_create_table_statement(),
             Token::Insert => self.parse_insert_statement(),
             Token::Delete => self.parse_delete_statement(),
+            Token::Update => self.parse_update_statement(),
             Token::Eof => None,
             _ => {
                 self.errors.push(format!(
@@ -963,6 +970,82 @@ impl<'a> Parser<'a> {
 
         Some(Statement::Delete(DeleteStatement {
             table_name,
+            where_clause,
+        }))
+    }
+
+    fn parse_update_statement(&mut self) -> Option<Statement> {
+        self.next_token();
+        let table_name = match &self.current_token {
+            Token::Identifier(name) => name.clone(),
+            _ => {
+                self.current_error_expected(Token::Identifier("table name".to_string()));
+                return None;
+            }
+        };
+        self.next_token();
+
+        if !self.current_token_is(Token::Set) {
+            self.current_error_expected(Token::Set);
+            return None;
+        }
+        self.next_token();
+
+        let mut assignments = Vec::new();
+        loop {
+            let column_name = match &self.current_token {
+                Token::Identifier(name) => name.clone(),
+                _ => {
+                    self.errors.push(format!(
+                        "Expected column name in SET clause, found {:?}",
+                        self.current_token
+                    ));
+                    return None;
+                }
+            };
+            self.next_token();
+
+            if !self.current_token_is(Token::Equal) {
+                self.current_error_expected(Token::Equal);
+                return None;
+            }
+            self.next_token();
+
+            let value_expr = match self.parse_expression(Precedence::Lowest) {
+                Some(expr) => expr,
+                None => {
+                    self.errors
+                        .push("Failed to parse expression in SET clause".to_string());
+                    return None;
+                }
+            };
+            assignments.push((column_name, value_expr));
+
+            if self.current_token_is(Token::Comma) {
+                self.next_token();
+            } else {
+                break;
+            }
+        }
+
+        let mut where_clause = None;
+        if self.current_token_is(Token::Where) {
+            self.next_token();
+            where_clause = self.parse_expression(Precedence::Lowest);
+            if where_clause.is_none() {
+                self.errors
+                    .push("Failed to parse WHERE clause expression for UPDATE".to_string());
+                return None;
+            }
+        }
+
+        if self.current_token_is(Token::Semicolon) {
+            self.next_token();
+        }
+
+        Some(Statement::Update(UpdateStatement {
+            table_name,
+            assignments,
             where_clause,
         }))
     }
@@ -1464,7 +1547,23 @@ mod parser_tests {
 
     #[test]
     fn test_delete_statement_with_where() {
-        let input = "DELETE FROM users WHERE user_id = 100;";
+        let input = "DELETE FROM products WHERE id = 1 OR category = 'old';";
+        let lexer = Lexer::new(input);
+        let mut parser = Parser::new(lexer);
+        let program = parser.parse_program();
+        assert!(parser.errors().is_empty(), "{:?}", parser.errors());
+
+        if let Some(Statement::Delete(stmt)) = program {
+            assert_eq!(stmt.table_name, "products");
+            assert!(stmt.where_clause.is_some());
+        } else {
+            panic!("Expected DeleteStatement");
+        }
+    }
+
+    #[test]
+    fn test_update_statement() {
+        let input = "UPDATE users SET email = 'new@example.com', status = 1 WHERE id = 10;";
         let lexer = Lexer::new(input);
         let mut parser = Parser::new(lexer);
         let program = parser.parse_program();
@@ -1476,16 +1575,14 @@ mod parser_tests {
         );
         assert!(program.is_some());
 
-        if let Some(Statement::Delete(stmt)) = program {
+        if let Some(Statement::Update(stmt)) = program {
             assert_eq!(stmt.table_name, "users");
+            assert_eq!(stmt.assignments.len(), 2);
+            assert_eq!(stmt.assignments[0].0, "email");
+            assert_eq!(stmt.assignments[1].0, "status");
             assert!(stmt.where_clause.is_some());
-
-            assert!(matches!(
-                stmt.where_clause.unwrap(),
-                Expression::BinaryOp { .. }
-            ));
         } else {
-            panic!("Expected DeleteStatement, got: {:?}", program);
+            panic!("Expected UpdateStatement, got: {:?}", program);
         }
     }
 }
@@ -1493,5 +1590,12 @@ mod parser_tests {
 #[derive(Debug, PartialEq, Clone)]
 pub struct DeleteStatement {
     pub table_name: String,
+    pub where_clause: Option<Expression>,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct UpdateStatement {
+    pub table_name: String,
+    pub assignments: Vec<(String, Expression)>,
     pub where_clause: Option<Expression>,
 }

@@ -3,23 +3,128 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>SQLR Query Tester</title>
+    <title>SQLR Web UI</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link
+      rel="stylesheet"
+      href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.15/codemirror.min.css"
+    />
+    <link
+      rel="stylesheet"
+      href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.15/theme/base16-light.min.css"
+    />
     <link rel="stylesheet" href="style.css" />
   </head>
-  <body>
-    <h1>SQLR Query Tester</h1>
-    <div class="container">
-      <textarea
-        id="query-input"
-        rows="10"
-        placeholder="Enter SQL query here..."
-      ></textarea>
-      <button id="submit-button">Execute Query</button>
-      <h2>Result</h2>
-      <pre id="result-output">Result will appear here...</pre>
-      <div id="result-table-container"></div>
+  <body class="bg-white text-gray-800 font-sans">
+    <div class="flex h-screen">
+      <div
+        class="w-64 bg-gray-50 p-4 border-r border-gray-200 flex flex-col h-full"
+      >
+        <h2 class="text-lg font-semibold mb-4">Tables</h2>
+        <div class="overflow-y-auto flex-grow">
+          <ul class="space-y-1" id="table-list">
+            <li>
+              <span class="block px-2 py-1 text-gray-500">Loading...</span>
+            </li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="flex-1 flex flex-col p-6 overflow-y-auto">
+        <h1 class="text-2xl font-bold mb-6">SQLR Web UI</h1>
+
+        <div class="flex flex-col lg:flex-row gap-6 flex-grow">
+          <div class="lg:w-1/2 flex flex-col">
+            <div class="flex justify-between items-center mb-2">
+              <h3 class="text-lg font-semibold">SQL Query</h3>
+              <div class="relative">
+                <button
+                  type="button"
+                  id="history-button"
+                  class="text-sm text-gray-600 hover:text-blue-600 px-2 py-1 border border-gray-300 rounded hover:border-blue-500 focus:outline-none"
+                >
+                  History
+                </button>
+                <ul
+                  id="query-history-list"
+                  class="hidden absolute right-0 mt-1 w-64 bg-white border border-gray-200 rounded-md shadow-lg z-10 max-h-60 overflow-y-auto"
+                >
+                  <li>
+                    <span class="block px-3 py-2 text-sm text-gray-500"
+                      >No history yet</span
+                    >
+                  </li>
+                </ul>
+              </div>
+            </div>
+            <div class="flex-grow">
+              <textarea
+                id="query-input"
+                class="w-full h-full overflow-hidden"
+              ></textarea>
+            </div>
+            <button
+              id="submit-button"
+              class="mt-3 w-full lg:w-auto self-start bg-blue-600 hover:bg-blue-700 text-white font-semibold py-2 px-4 rounded focus:outline-none focus:ring-2 focus:ring-blue-300 inline-flex items-center justify-center"
+            >
+              Execute Query
+              <svg
+                id="loading-spinner"
+                class="animate-spin ml-2 h-4 w-4 text-white hidden"
+                xmlns="http://www.w3.org/2000/svg"
+                fill="none"
+                viewBox="0 0 24 24"
+              >
+                <circle
+                  class="opacity-25"
+                  cx="12"
+                  cy="12"
+                  r="10"
+                  stroke="currentColor"
+                  stroke-width="4"
+                ></circle>
+                <path
+                  class="opacity-75"
+                  fill="currentColor"
+                  d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
+                ></path>
+              </svg>
+            </button>
+          </div>
+
+          <div class="lg:w-1/2 flex flex-col">
+            <h3 class="text-lg font-semibold mb-2">Result / Structure</h3>
+            <div
+              id="status-message"
+              class="p-3 mb-3 text-sm bg-gray-100 text-gray-700 rounded border border-gray-200"
+              role="alert"
+            >
+              Enter a query or select a table from the sidebar.
+            </div>
+            <div id="structure-area" class="mb-3 hidden">
+              <h4 class="text-md font-semibold mb-1">
+                Structure:
+                <span id="structure-table-name" class="font-mono"></span>
+              </h4>
+              <ul
+                id="structure-column-list"
+                class="list-none bg-white border border-gray-200 rounded p-2 space-y-1"
+              ></ul>
+            </div>
+            <div id="result-area" class="flex-grow overflow-auto">
+              <pre
+                id="error-output"
+                class="p-3 text-sm text-red-700 bg-red-100 border border-red-200 rounded hidden whitespace-pre-wrap"
+              ></pre>
+              <div id="result-table-container" class="overflow-x-auto"></div>
+            </div>
+          </div>
+        </div>
+      </div>
     </div>
 
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.15/codemirror.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.15/mode/sql/sql.min.js"></script>
     <script src="script.js"></script>
   </body>
 </html>

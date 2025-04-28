@@ -131,6 +131,43 @@ impl StorageManager {
         self.tables.get(table_name)
     }
 
+    pub fn list_table_names(&self) -> Vec<String> {
+        self.tables.keys().cloned().collect()
+    }
+
+    pub fn update_row_values(
+        &mut self,
+        table_name: &str,
+        row_index: usize,
+        updates: &[(usize, Value)],
+    ) -> Result<(), String> {
+        let table = self
+            .tables
+            .get_mut(table_name)
+            .ok_or_else(|| format!("Table '{}' not found for update.", table_name))?;
+
+        if row_index >= table.rows.len() {
+            return Err(format!(
+                "Row index {} out of bounds for table '{}'",
+                row_index, table_name
+            ));
+        }
+
+        let row = &mut table.rows[row_index];
+
+        for &(col_index, ref new_value) in updates {
+            if col_index >= table.columns.len() {
+                return Err(format!(
+                    "Column index {} out of bounds for table '{}'",
+                    col_index, table_name
+                ));
+            }
+            row[col_index] = new_value.clone();
+        }
+
+        Ok(())
+    }
+
     pub fn delete_rows(
         &mut self,
         table_name: &str,
@@ -144,7 +181,6 @@ impl StorageManager {
         indices_to_delete.sort_unstable_by(|a, b| b.cmp(a));
         indices_to_delete.dedup();
 
-        let initial_rows = table.rows.len();
         let mut deleted_count = 0;
 
         for index in indices_to_delete {
