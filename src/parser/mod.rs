@@ -38,6 +38,18 @@ pub enum Token {
 
     Update,
     Set,
+
+    Join,
+    Inner,
+    Left,
+    Right,
+    Full,
+    Outer,
+    On,
+
+    Dot,
+
+    As,
 }
 
 pub struct Lexer<'a> {
@@ -144,6 +156,14 @@ impl<'a> Lexer<'a> {
             "DELETE" => Token::Delete,
             "UPDATE" => Token::Update,
             "SET" => Token::Set,
+            "JOIN" => Token::Join,
+            "INNER" => Token::Inner,
+            "LEFT" => Token::Left,
+            "RIGHT" => Token::Right,
+            "FULL" => Token::Full,
+            "OUTER" => Token::Outer,
+            "ON" => Token::On,
+            "AS" => Token::As,
             _ => Token::Identifier(ident.to_string()),
         }
     }
@@ -215,6 +235,10 @@ impl<'a> Lexer<'a> {
                 let quote_type = self.ch.unwrap();
                 let literal = self.read_string(quote_type);
                 Token::String(literal)
+            }
+            Some('.') => {
+                self.read_char();
+                Token::Dot
             }
             Some(ch) => {
                 if ch.is_alphabetic() || ch == '_' {
@@ -324,7 +348,7 @@ mod tests {
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum Expression {
-    Identifier(String),
+    QualifiedIdentifier(QualifiedIdentifier),
     Literal(LiteralValue),
     UnaryOp {
         op: UnaryOperator,
@@ -347,16 +371,47 @@ pub enum LiteralValue {
 }
 
 #[derive(Debug, PartialEq, Clone)]
+pub struct QualifiedIdentifier {
+    pub table: Option<String>,
+    pub identifier: String,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum JoinType {
+    Inner,
+    LeftOuter,
+    RightOuter,
+    FullOuter,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct JoinClause {
+    pub join_type: JoinType,
+    pub table: String,
+    pub on_condition: Option<Expression>,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct FromClause {
+    pub base_table: String,
+    pub joins: Vec<JoinClause>,
+}
+
+#[derive(Debug, PartialEq, Clone)]
 pub struct SelectStatement {
     pub columns: Vec<SelectItem>,
-    pub from_table: Option<String>,
+    pub from_clause: Option<FromClause>,
     pub where_clause: Option<Expression>,
 }
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum SelectItem {
     Wildcard,
-    UnnamedExpr(Expression),
+    Expression {
+        expr: Expression,
+        alias: Option<String>,
+    },
+    QualifiedWildcard(String),
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -503,14 +558,13 @@ impl<'a> Parser<'a> {
         }
         self.next_token();
 
-        let table_name = match &self.current_token {
-            Token::Identifier(name) => name.clone(),
-            _ => {
-                self.current_error_expected(Token::Identifier("Identifier".to_string()));
+        let from_clause = match self.parse_from_clause() {
+            Ok(fc) => fc,
+            Err(e) => {
+                self.errors.push(e);
                 return None;
             }
         };
-        self.next_token();
 
         let mut where_clause = None;
         if self.current_token_is(Token::Where) {
@@ -529,32 +583,100 @@ impl<'a> Parser<'a> {
 
         Some(Statement::Select(SelectStatement {
             columns,
-            from_table: Some(table_name),
+            from_clause: Some(from_clause),
             where_clause,
         }))
     }
 
     fn parse_select_list(&mut self) -> Result<Vec<SelectItem>, String> {
         let mut list = Vec::new();
-        if self.current_token_is(Token::Asterisk) {
-            self.next_token();
-            list.push(SelectItem::Wildcard);
-            return Ok(list);
-        }
 
         loop {
-            match self.parse_expression(Precedence::Lowest) {
-                Some(expr) => list.push(SelectItem::UnnamedExpr(expr)),
-                None => return Err("Expected expression in SELECT list".to_string()),
+            if self.current_token_is(Token::Asterisk) {
+                self.next_token();
+                if list.is_empty() {
+                    list.push(SelectItem::Wildcard);
+                    if !matches!(
+                        self.current_token,
+                        Token::From | Token::Semicolon | Token::Eof
+                    ) {
+                        return Err(format!(
+                            "Unexpected token {:?} after '*' in SELECT list. Expected FROM or end of statement.",
+                            self.current_token
+                        ));
+                    }
+                } else {
+                    return Err(
+                        "Unexpected '*' in SELECT list. '*' must be the only select item."
+                            .to_string(),
+                    );
+                }
+            } else {
+                match self.parse_expression(Precedence::Lowest) {
+                    Some(expr) => {
+                        let mut alias = None;
+                        if self.current_token_is(Token::As) {
+                            self.next_token();
+                            if let Token::Identifier(alias_name) = &self.current_token {
+                                alias = Some(alias_name.clone());
+                                self.next_token();
+                            } else {
+                                return Err(format!(
+                                    "Expected identifier after AS, found {:?}",
+                                    self.current_token
+                                ));
+                            }
+                        } else if let Token::Identifier(potential_alias) = &self.current_token {
+                            if !matches!(
+                                self.current_token,
+                                Token::From
+                                    | Token::Where
+                                    | Token::Join
+                                    | Token::Comma
+                                    | Token::Semicolon
+                                    | Token::Eof
+                            ) {
+                                alias = Some(potential_alias.clone());
+                                self.next_token();
+                            }
+                        }
+                        list.push(SelectItem::Expression { expr, alias });
+                    }
+                    None => {
+                        return Err(format!(
+                            "Failed to parse expression item in SELECT list near {:?}",
+                            self.current_token
+                        ));
+                    }
+                }
             }
-
-            self.next_token();
 
             if !self.current_token_is(Token::Comma) {
                 break;
             }
             self.next_token();
+
+            if matches!(
+                self.current_token,
+                Token::From | Token::Semicolon | Token::Eof
+            ) {
+                return Err(
+                    "Trailing comma found in SELECT list, or unexpected end of statement."
+                        .to_string(),
+                );
+            }
         }
+
+        if !matches!(
+            self.current_token,
+            Token::From | Token::Semicolon | Token::Eof
+        ) {
+            return Err(format!(
+                "Expected FROM or end of statement after SELECT list, found {:?}",
+                self.current_token
+            ));
+        }
+
         Ok(list)
     }
 
@@ -583,7 +705,31 @@ impl<'a> Parser<'a> {
 
     fn parse_prefix(&mut self) -> Option<Expression> {
         match self.current_token {
-            Token::Identifier(ref name) => Some(Expression::Identifier(name.clone())),
+            Token::Identifier(ref name) => {
+                let base_identifier = name.clone();
+                if self.peek_token_is(Token::Dot) {
+                    self.next_token();
+                    if let Token::Identifier(ref column_name) = self.peek_token {
+                        let qualified_name = QualifiedIdentifier {
+                            table: Some(base_identifier),
+                            identifier: column_name.clone(),
+                        };
+                        self.next_token();
+                        Some(Expression::QualifiedIdentifier(qualified_name))
+                    } else {
+                        self.errors.push(format!(
+                            "Expected identifier after '.', found {:?}",
+                            self.peek_token
+                        ));
+                        None
+                    }
+                } else {
+                    Some(Expression::QualifiedIdentifier(QualifiedIdentifier {
+                        table: None,
+                        identifier: base_identifier,
+                    }))
+                }
+            }
             Token::Number(ref value) => {
                 Some(Expression::Literal(LiteralValue::Number(value.clone())))
             }
@@ -1049,6 +1195,110 @@ impl<'a> Parser<'a> {
             where_clause,
         }))
     }
+
+    fn parse_from_clause(&mut self) -> Result<FromClause, String> {
+        let base_table = match &self.current_token {
+            Token::Identifier(name) => name.clone(),
+            _ => {
+                return Err(format!(
+                    "Expected base table name (Identifier) after FROM, found {:?}",
+                    self.current_token
+                ));
+            }
+        };
+        self.next_token();
+
+        let mut joins = Vec::new();
+
+        loop {
+            let mut current_join_type = None;
+
+            match self.current_token {
+                Token::Inner | Token::Join => {
+                    current_join_type = Some(JoinType::Inner);
+                    self.next_token();
+                    if self.current_token_is(Token::Join) {
+                        self.next_token();
+                    }
+                }
+                Token::Left => {
+                    self.next_token();
+                    if self.current_token_is(Token::Outer) {
+                        self.next_token();
+                    }
+                    if self.current_token_is(Token::Join) {
+                        self.next_token();
+                        current_join_type = Some(JoinType::LeftOuter);
+                    } else {
+                        return Err("Expected JOIN after LEFT [OUTER]".to_string());
+                    }
+                }
+                Token::Right => {
+                    self.next_token();
+                    if self.current_token_is(Token::Outer) {
+                        self.next_token();
+                    }
+                    if self.current_token_is(Token::Join) {
+                        self.next_token();
+                        current_join_type = Some(JoinType::RightOuter);
+                    } else {
+                        return Err("Expected JOIN after RIGHT [OUTER]".to_string());
+                    }
+                }
+                Token::Full => {
+                    self.next_token();
+                    if self.current_token_is(Token::Outer) {
+                        self.next_token();
+                    }
+                    if self.current_token_is(Token::Join) {
+                        self.next_token();
+                        current_join_type = Some(JoinType::FullOuter);
+                    } else {
+                        return Err("Expected JOIN after FULL [OUTER]".to_string());
+                    }
+                }
+                _ => {
+                    break;
+                }
+            }
+
+            if let Some(join_type) = current_join_type {
+                let joined_table = match &self.current_token {
+                    Token::Identifier(name) => name.clone(),
+                    _ => {
+                        return Err(format!(
+                            "Expected joined table name (Identifier) after JOIN, found {:?}",
+                            self.current_token
+                        ));
+                    }
+                };
+                self.next_token();
+
+                if !self.current_token_is(Token::On) {
+                    return Err(format!(
+                        "Expected ON after joined table name, found {:?}",
+                        self.current_token
+                    ));
+                }
+                self.next_token();
+
+                let on_condition = self.parse_expression(Precedence::Lowest);
+                if on_condition.is_none() {
+                    return Err("Failed to parse ON condition expression".to_string());
+                }
+
+                joins.push(JoinClause {
+                    join_type,
+                    table: joined_table,
+                    on_condition,
+                });
+            } else {
+                break;
+            }
+        }
+
+        Ok(FromClause { base_table, joins })
+    }
 }
 
 #[cfg(test)]
@@ -1073,13 +1323,31 @@ mod parser_tests {
             assert_eq!(stmt.columns.len(), 2);
             assert_eq!(
                 stmt.columns[0],
-                SelectItem::UnnamedExpr(Expression::Identifier("column1".to_string()))
+                SelectItem::Expression {
+                    expr: Expression::QualifiedIdentifier(QualifiedIdentifier {
+                        table: None,
+                        identifier: "column1".to_string()
+                    }),
+                    alias: None
+                }
             );
             assert_eq!(
                 stmt.columns[1],
-                SelectItem::UnnamedExpr(Expression::Identifier("column2".to_string()))
+                SelectItem::Expression {
+                    expr: Expression::QualifiedIdentifier(QualifiedIdentifier {
+                        table: None,
+                        identifier: "column2".to_string()
+                    }),
+                    alias: None
+                }
             );
-            assert_eq!(stmt.from_table, Some("my_table".to_string()));
+            assert_eq!(
+                stmt.from_clause,
+                Some(FromClause {
+                    base_table: "my_table".to_string(),
+                    joins: Vec::new()
+                })
+            );
         } else {
             panic!("Expected SelectStatement, got: {:?}", program);
         }
@@ -1102,7 +1370,13 @@ mod parser_tests {
         if let Some(Statement::Select(stmt)) = program {
             assert_eq!(stmt.columns.len(), 1);
             assert_eq!(stmt.columns[0], SelectItem::Wildcard);
-            assert_eq!(stmt.from_table, Some("users".to_string()));
+            assert_eq!(
+                stmt.from_clause,
+                Some(FromClause {
+                    base_table: "users".to_string(),
+                    joins: Vec::new()
+                })
+            );
         } else {
             panic!("Expected SelectStatement, got: {:?}", program);
         }
@@ -1287,7 +1561,10 @@ mod parser_tests {
         if let Some(Statement::Select(stmt)) = program {
             assert!(stmt.where_clause.is_some());
             let expected_where = Expression::BinaryOp {
-                left: Box::new(Expression::Identifier("id".to_string())),
+                left: Box::new(Expression::QualifiedIdentifier(QualifiedIdentifier {
+                    table: None,
+                    identifier: "id".to_string(),
+                })),
                 op: BinaryOperator::Eq,
                 right: Box::new(Expression::Literal(LiteralValue::Number("1".to_string()))),
             };
@@ -1314,7 +1591,10 @@ mod parser_tests {
         if let Some(Statement::Select(stmt)) = program {
             assert!(stmt.where_clause.is_some());
             let expected_where = Expression::BinaryOp {
-                left: Box::new(Expression::Identifier("sku".to_string())),
+                left: Box::new(Expression::QualifiedIdentifier(QualifiedIdentifier {
+                    table: None,
+                    identifier: "sku".to_string(),
+                })),
                 op: BinaryOperator::Neq,
                 right: Box::new(Expression::Literal(LiteralValue::String("ABC".to_string()))),
             };
@@ -1356,7 +1636,13 @@ mod parser_tests {
                 } = *l_and
                 {
                     assert_eq!(op_eq, BinaryOperator::Eq);
-                    assert_eq!(*l_eq, Expression::Identifier("city".to_string()));
+                    assert_eq!(
+                        *l_eq,
+                        Expression::QualifiedIdentifier(QualifiedIdentifier {
+                            table: None,
+                            identifier: "city".to_string()
+                        })
+                    );
                     assert_eq!(
                         *r_eq,
                         Expression::Literal(LiteralValue::String("London".to_string()))
@@ -1372,7 +1658,13 @@ mod parser_tests {
                 } = *r_and
                 {
                     assert_eq!(op_gt, BinaryOperator::Gt);
-                    assert_eq!(*l_gt, Expression::Identifier("user_id".to_string()));
+                    assert_eq!(
+                        *l_gt,
+                        Expression::QualifiedIdentifier(QualifiedIdentifier {
+                            table: None,
+                            identifier: "user_id".to_string()
+                        })
+                    );
                     assert_eq!(
                         *r_gt,
                         Expression::Literal(LiteralValue::Number("10".to_string()))
@@ -1411,7 +1703,10 @@ mod parser_tests {
             Expression::UnaryOp {
                 op: UnaryOperator::Not,
                 expr: Box::new(Expression::BinaryOp {
-                    left: Box::new(Expression::Identifier("id".to_string())),
+                    left: Box::new(Expression::QualifiedIdentifier(QualifiedIdentifier {
+                        table: None,
+                        identifier: "id".to_string()
+                    })),
                     op: BinaryOperator::Eq,
                     right: Box::new(Expression::Literal(LiteralValue::Number("1".to_string())))
                 })
@@ -1448,7 +1743,10 @@ mod parser_tests {
             assert_eq!(
                 *and_right,
                 Expression::BinaryOp {
-                    left: Box::new(Expression::Identifier("city".to_string())),
+                    left: Box::new(Expression::QualifiedIdentifier(QualifiedIdentifier {
+                        table: None,
+                        identifier: "city".to_string()
+                    })),
                     op: BinaryOperator::Eq,
                     right: Box::new(Expression::Literal(LiteralValue::String("A".to_string())))
                 }
@@ -1464,7 +1762,10 @@ mod parser_tests {
                 assert_eq!(
                     *or_left,
                     Expression::BinaryOp {
-                        left: Box::new(Expression::Identifier("id".to_string())),
+                        left: Box::new(Expression::QualifiedIdentifier(QualifiedIdentifier {
+                            table: None,
+                            identifier: "id".to_string()
+                        })),
                         op: BinaryOperator::Eq,
                         right: Box::new(Expression::Literal(LiteralValue::Number("1".to_string())))
                     }
@@ -1472,7 +1773,10 @@ mod parser_tests {
                 assert_eq!(
                     *or_right,
                     Expression::BinaryOp {
-                        left: Box::new(Expression::Identifier("id".to_string())),
+                        left: Box::new(Expression::QualifiedIdentifier(QualifiedIdentifier {
+                            table: None,
+                            identifier: "id".to_string()
+                        })),
                         op: BinaryOperator::Eq,
                         right: Box::new(Expression::Literal(LiteralValue::Number("2".to_string())))
                     }
@@ -1512,11 +1816,21 @@ mod parser_tests {
             assert_eq!(or_op, BinaryOperator::Or);
             assert_eq!(
                 *or_left,
-                Expression::IsNull(Box::new(Expression::Identifier("name".to_string())))
+                Expression::IsNull(Box::new(Expression::QualifiedIdentifier(
+                    QualifiedIdentifier {
+                        table: None,
+                        identifier: "name".to_string()
+                    }
+                )))
             );
             assert_eq!(
                 *or_right,
-                Expression::IsNotNull(Box::new(Expression::Identifier("email".to_string())))
+                Expression::IsNotNull(Box::new(Expression::QualifiedIdentifier(
+                    QualifiedIdentifier {
+                        table: None,
+                        identifier: "email".to_string()
+                    }
+                )))
             );
         } else {
             panic!("Expected OR expression at top level");
