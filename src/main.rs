@@ -6,7 +6,7 @@ use axum::{Router, extract::State, http::StatusCode, response::Json, routing::po
 use clap::Parser as ClapParser;
 use serde::Deserialize;
 use serde_json::json;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::signal;
 use tower_http::services::ServeDir;
@@ -125,20 +125,20 @@ fn run_parser_repl() {
     println!("Exiting parser test mode.");
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
 
     if args.test_parser {
         run_parser_repl();
         Ok(())
     } else if args.web_ui {
-        run_web_ui()
+        run_web_ui().await
     } else {
-        run_tcp_server()
+        run_tcp_server().await
     }
 }
 
-#[tokio::main]
 async fn run_web_ui() -> Result<(), Box<dyn Error>> {
     let initial_storage = match StorageManager::load(DB_FILE_PATH) {
         Ok(s) => {
@@ -253,33 +253,190 @@ async fn handle_api_query(
     }
 }
 
-#[tokio::main]
 async fn run_tcp_server() -> Result<(), Box<dyn Error>> {
-    let listener = TcpListener::bind("127.0.0.1:3306").await?;
-    println!("SQLR TCP server listening on 127.0.0.1:3306");
+    println!("Starting SQLR TCP Server...");
+
+    let initial_storage = match StorageManager::load(DB_FILE_PATH) {
+        Ok(s) => {
+            println!("Loaded database state from {}", DB_FILE_PATH);
+            s
+        }
+        Err(e) => {
+            eprintln!(
+                "WARN: Failed to load database state ('{}'), starting fresh: {}",
+                DB_FILE_PATH, e
+            );
+            StorageManager::new()
+        }
+    };
+    let storage_manager = Arc::new(Mutex::new(initial_storage));
+    let app_state: AppState = storage_manager.clone();
+
+    let listener = TcpListener::bind("127.0.0.1:7878").await?;
+    println!("TCP Server listening on 127.0.0.1:7878");
+
+    let shutdown_storage_manager = storage_manager.clone();
+    let shutdown_signal_task = tokio::spawn(async move {
+        signal::ctrl_c()
+            .await
+            .expect("Failed to install Ctrl+C handler");
+        println!("\nReceived Ctrl+C, attempting to save database...");
+        match shutdown_storage_manager.lock() {
+            Ok(storage) => {
+                if let Err(e) = storage.save(DB_FILE_PATH) {
+                    eprintln!(
+                        "ERROR: Failed to save database to '{}': {}",
+                        DB_FILE_PATH, e
+                    );
+                } else {
+                    println!("Database saved successfully to {}", DB_FILE_PATH);
+                }
+            }
+            Err(e) => {
+                eprintln!("ERROR: Could not acquire storage lock for saving: {}", e);
+            }
+        }
+    });
 
     loop {
-        let (socket, addr) = listener.accept().await?;
-        println!("Accepted connection from: {}", addr);
-
-        tokio::spawn(async move {
-            handle_connection(socket).await;
-        });
+        tokio::select! {
+            res = listener.accept() => {
+                match res {
+                    Ok((stream, addr)) => {
+                        println!("Accepted connection from: {}", addr);
+                        let state_clone = app_state.clone();
+                        tokio::spawn(async move {
+                            handle_connection(stream, state_clone).await;
+                        });
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to accept connection: {}", e);
+                    }
+                }
+            }
+            _ = signal::ctrl_c() => {
+                println!("Ctrl+C received again, starting shutdown sequence immediately.");
+                break;
+            }
+        }
     }
+
+    let _ = shutdown_signal_task.await;
+    println!("TCP Server shut down gracefully.");
+
+    Ok(())
 }
 
-async fn handle_connection(mut stream: TcpStream) {
-    println!("Handling connection for {}", stream.peer_addr().unwrap());
+async fn handle_connection(mut stream: TcpStream, state: AppState) {
+    let peer_addr = stream
+        .peer_addr()
+        .map(|addr| addr.to_string())
+        .unwrap_or_else(|_| "unknown peer".to_string());
+    println!("Handling connection from {}", peer_addr);
 
-    if let Err(e) = stream
-        .write_all(b"Hello from SQLR! (Raw TCP) Closing connection.\n")
-        .await
-    {
-        eprintln!("Failed to write to socket: {}", e);
+    if let Err(e) = stream.write_all(b"SQLR 0.1.0\n").await {
+        eprintln!("[{}] Failed to write welcome message: {}", peer_addr, e);
+        return;
     }
 
-    if let Err(e) = stream.shutdown().await {
-        eprintln!("Failed to shutdown socket: {}", e);
+    let mut reader = BufReader::new(&mut stream);
+    let mut line_buf = String::new();
+
+    loop {
+        line_buf.clear();
+        match reader.read_line(&mut line_buf).await {
+            Ok(0) => {
+                println!("[{}] Connection closed by client.", peer_addr);
+                break;
+            }
+            Ok(_) => {
+                let sql = line_buf.trim();
+                if sql.is_empty() {
+                    continue;
+                }
+
+                let response_json = process_query(sql, &state).await;
+
+                match serde_json::to_string(&response_json) {
+                    Ok(json_string) => {
+                        let response_line = format!("{}\n", json_string);
+                        if let Err(e) = reader.get_mut().write_all(response_line.as_bytes()).await {
+                            eprintln!("[{}] Failed to write response: {}", peer_addr, e);
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[{}] Failed to serialize response: {}", peer_addr, e);
+                        let error_msg = "{\"error\":true, \"message\":\"Internal server error: Failed to serialize response\"}\n";
+                        if let Err(e_write) = reader.get_mut().write_all(error_msg.as_bytes()).await
+                        {
+                            eprintln!(
+                                "[{}] Failed to write serialization error message: {}",
+                                peer_addr, e_write
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("[{}] Error reading from socket: {}", peer_addr, e);
+                break;
+            }
+        }
     }
-    println!("Connection closed for {}", stream.peer_addr().unwrap());
+
+    println!("[{}] Connection handler finished.", peer_addr);
+}
+
+async fn process_query(sql: &str, state: &AppState) -> serde_json::Value {
+    let lexer = Lexer::new(sql);
+    let mut parser = Parser::new(lexer);
+    let program = parser.parse_program();
+
+    let errors = parser.errors();
+    if !errors.is_empty() {
+        return json!({
+            "error": true,
+            "message": "Parser Error(s)",
+            "details": errors
+        });
+    }
+
+    let statement = match program {
+        Some(stmt) => stmt,
+        None => {
+            return json!({
+                "error": false,
+                "message": "Parsed successfully, but no statement was generated.",
+                "result": null
+            });
+        }
+    };
+
+    let mut storage_guard = match state.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            eprintln!("Storage lock poisoned: {}", poisoned);
+            return json!({
+                "error": true,
+                "message": "Internal server error: Cannot acquire storage lock"
+            });
+        }
+    };
+
+    let mut executor = Executor::new(&mut *storage_guard);
+
+    match executor.execute_statement(statement) {
+        Ok(result) => json!({
+            "error": false,
+            "message": "Execution successful",
+            "result": result
+        }),
+        Err(exec_err) => json!({
+            "error": true,
+            "message": "Execution Error",
+            "details": exec_err.to_string()
+        }),
+    }
 }
