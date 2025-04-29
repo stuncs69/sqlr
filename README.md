@@ -25,7 +25,7 @@ Unleash the power of SQL with **SQLR**, the blazing-fast 🚀, Rust-powered data
 ## 🚀 Get Started in Minutes! 🚀
 
 1.  **Install Rust:** Grab the toolchain from [rustup.rs](https://rustup.rs/) if you haven't already.
-2.  **Clone:** `git clone https://github.com/stuncs69/sqlr.git` *(Update URL!)*
+2.  **Clone:** `git clone https://github.com/stuncs69/sqlr.git`
 3.  **Navigate:** `cd sqlr`
 4.  **Build:** `cargo build --release` for the ultimate performance! 💪
 
