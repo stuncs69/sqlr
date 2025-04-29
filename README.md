@@ -112,4 +112,4 @@ Integrate SQLR effortlessly:
 
 ## License
 
-TBD
+[BSD-3 Clause license](https://github.com/stuncs69/sqlr/blob/master/LICENSE)
