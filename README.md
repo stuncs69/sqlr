@@ -61,14 +61,14 @@ Launch SQLR in your preferred mode from the project root:
 telnet 127.0.0.1 7878
 ```
 
-*Welcome to the SQLR TCP Interface! Send SQL queries terminated by newline.*
-**Type:** `CREATE TABLE users (id INTEGER, name TEXT);`⏎
+*Welcome to the SQLR TCP Interface! Send SQL queries terminated by newline.*</br>
+**Type:** `CREATE TABLE users (id INTEGER, name TEXT);`⏎</br>
 **Response:** `{"error":false,"message":"Execution successful","result":"Table 'users' created successfully."}`
 
-**Type:** `INSERT INTO users (id, name) VALUES (1, 'Alice');`⏎
-**Response:** `{"error":false,"message":"Execution successful","result":"1 row(s) inserted."}`
+**Type:** `INSERT INTO users (id, name) VALUES (1, 'Alice');`⏎</br>
+**Response:** `{"error":false,"message":"Execution successful","result":"1 row(s) inserted."}`</br>
 
-**Type:** `SELECT name FROM users WHERE id = 1;`⏎
+**Type:** `SELECT name FROM users WHERE id = 1;`⏎</br>
 **Response:** `{"error":false,"message":"Execution successful","result":{"columns":["name"],"rows":[["Alice"]]}}`
 
 *(Exit telnet using Ctrl+] then `quit`)*
