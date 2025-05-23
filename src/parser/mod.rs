@@ -50,6 +50,8 @@ pub enum Token {
     Dot,
 
     As,
+
+    Function(String),
 }
 
 pub struct Lexer<'a> {
@@ -139,7 +141,24 @@ impl<'a> Lexer<'a> {
     }
 
     fn lookup_ident(ident: &str) -> Token {
-        match ident.to_uppercase().as_str() {
+        let upper_ident = ident.to_uppercase();
+
+        let common_functions = [
+            "CONNECTION_ID",
+            "VERSION",
+            "DATABASE",
+            "USER",
+            "CURRENT_USER",
+            "NOW",
+            "CURDATE",
+            "CURTIME",
+        ];
+
+        if common_functions.contains(&upper_ident.as_str()) {
+            return Token::Function(upper_ident);
+        }
+
+        match upper_ident.as_str() {
             "SELECT" => Token::Select,
             "FROM" => Token::From,
             "WHERE" => Token::Where,
@@ -361,6 +380,10 @@ pub enum Expression {
     },
     IsNull(Box<Expression>),
     IsNotNull(Box<Expression>),
+    FunctionCall {
+        name: String,
+        arguments: Vec<Expression>,
+    },
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -704,8 +727,8 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_prefix(&mut self) -> Option<Expression> {
-        match self.current_token {
-            Token::Identifier(ref name) => {
+        match &self.current_token {
+            Token::Identifier(name) => {
                 let base_identifier = name.clone();
                 if self.peek_token_is(Token::Dot) {
                     self.next_token();
@@ -723,6 +746,44 @@ impl<'a> Parser<'a> {
                         ));
                         None
                     }
+                } else if self.peek_token_is(Token::LeftParen) {
+                    self.next_token();
+
+                    let args = if self.peek_token_is(Token::RightParen) {
+                        self.next_token();
+                        Vec::new()
+                    } else {
+                        self.next_token();
+                        let mut args = Vec::new();
+
+                        loop {
+                            match self.parse_expression(Precedence::Lowest) {
+                                Some(expr) => args.push(expr),
+                                None => break,
+                            }
+
+                            if !self.peek_token_is(Token::Comma) {
+                                break;
+                            }
+                            self.next_token();
+                            self.next_token();
+                        }
+
+                        if !self.peek_token_is(Token::RightParen) {
+                            self.errors.push(format!(
+                                "Expected ')' after function arguments, found {:?}",
+                                self.peek_token
+                            ));
+                            return None;
+                        }
+                        self.next_token();
+                        args
+                    };
+
+                    Some(Expression::FunctionCall {
+                        name: base_identifier,
+                        arguments: args,
+                    })
                 } else {
                     Some(Expression::QualifiedIdentifier(QualifiedIdentifier {
                         table: None,
@@ -730,16 +791,59 @@ impl<'a> Parser<'a> {
                     }))
                 }
             }
-            Token::Number(ref value) => {
-                Some(Expression::Literal(LiteralValue::Number(value.clone())))
-            }
-            Token::String(ref value) => {
-                Some(Expression::Literal(LiteralValue::String(value.clone())))
-            }
-            Token::Null => Some(Expression::Literal(LiteralValue::Null)),
-            Token::Not => self.parse_prefix_unary(),
-            Token::LeftParen => self.parse_grouped_expression(),
+            Token::Function(name) => {
+                let func_name = name.clone();
+                if !self.peek_token_is(Token::LeftParen) {
+                    self.errors.push(format!(
+                        "Expected '(' after function name, found {:?}",
+                        self.peek_token
+                    ));
+                    return None;
+                }
 
+                self.next_token();
+
+                let args = if self.peek_token_is(Token::RightParen) {
+                    self.next_token();
+                    Vec::new()
+                } else {
+                    self.next_token();
+                    let mut args = Vec::new();
+
+                    loop {
+                        match self.parse_expression(Precedence::Lowest) {
+                            Some(expr) => args.push(expr),
+                            None => break,
+                        }
+
+                        if !self.peek_token_is(Token::Comma) {
+                            break;
+                        }
+                        self.next_token();
+                        self.next_token();
+                    }
+
+                    if !self.peek_token_is(Token::RightParen) {
+                        self.errors.push(format!(
+                            "Expected ')' after function arguments, found {:?}",
+                            self.peek_token
+                        ));
+                        return None;
+                    }
+                    self.next_token();
+                    args
+                };
+
+                Some(Expression::FunctionCall {
+                    name: func_name,
+                    arguments: args,
+                })
+            }
+            Token::Number(value) => Some(Expression::Literal(LiteralValue::Number(value.clone()))),
+            Token::String(value) => Some(Expression::Literal(LiteralValue::String(value.clone()))),
+            Token::LeftParen => self.parse_grouped_expression(),
+            Token::Not => self.parse_prefix_unary(),
+            Token::Null => Some(Expression::Literal(LiteralValue::Null)),
             _ => None,
         }
     }

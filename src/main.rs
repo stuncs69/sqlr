@@ -1,6 +1,7 @@
 use std::error::Error;
 use std::io::{self, Write};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 
 use axum::{Router, extract::State, http::StatusCode, response::Json, routing::post};
 use clap::Parser as ClapParser;
@@ -9,9 +10,11 @@ use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::signal;
+use tokio::sync::Mutex;
 use tower_http::services::ServeDir;
 
 mod executor;
+mod mysql;
 mod parser;
 mod storage;
 
@@ -27,6 +30,12 @@ struct Args {
 
     #[arg(long)]
     web_ui: bool,
+
+    #[arg(long)]
+    mysql_compat: bool,
+
+    #[arg(long, default_value = "3306")]
+    mysql_port: u16,
 }
 
 type AppState = Arc<Mutex<StorageManager>>;
@@ -134,6 +143,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Ok(())
     } else if args.web_ui {
         run_web_ui().await
+    } else if args.mysql_compat {
+        run_mysql_server(args.mysql_port).await
     } else {
         run_tcp_server().await
     }
@@ -170,20 +181,14 @@ async fn run_web_ui() -> Result<(), Box<dyn Error>> {
             .await
             .expect("Failed to install Ctrl+C handler");
         println!("\nReceived Ctrl+C, attempting to save database...");
-        match shutdown_storage_manager.lock() {
-            Ok(storage) => {
-                if let Err(e) = storage.save(DB_FILE_PATH) {
-                    eprintln!(
-                        "ERROR: Failed to save database to '{}': {}",
-                        DB_FILE_PATH, e
-                    );
-                } else {
-                    println!("Database saved successfully to {}", DB_FILE_PATH);
-                }
-            }
-            Err(e) => {
-                eprintln!("ERROR: Could not acquire storage lock for saving: {}", e);
-            }
+        let mut storage = shutdown_storage_manager.lock().await;
+        if let Err(e) = storage.save(DB_FILE_PATH) {
+            eprintln!(
+                "ERROR: Failed to save database to '{}': {}",
+                DB_FILE_PATH, e
+            );
+        } else {
+            println!("Database saved successfully to {}", DB_FILE_PATH);
         }
     };
 
@@ -228,15 +233,8 @@ async fn handle_api_query(
         }
     };
 
-    let mut storage_guard = match state.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => {
-            eprintln!("Storage lock poisoned: {}", poisoned);
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Internal server error: Cannot acquire storage lock".to_string(),
-            ));
-        }
+    let mut storage_guard = match state.lock().await {
+        storage => storage,
     };
 
     let mut executor = Executor::new(&mut *storage_guard);
@@ -281,20 +279,14 @@ async fn run_tcp_server() -> Result<(), Box<dyn Error>> {
             .await
             .expect("Failed to install Ctrl+C handler");
         println!("\nReceived Ctrl+C, attempting to save database...");
-        match shutdown_storage_manager.lock() {
-            Ok(storage) => {
-                if let Err(e) = storage.save(DB_FILE_PATH) {
-                    eprintln!(
-                        "ERROR: Failed to save database to '{}': {}",
-                        DB_FILE_PATH, e
-                    );
-                } else {
-                    println!("Database saved successfully to {}", DB_FILE_PATH);
-                }
-            }
-            Err(e) => {
-                eprintln!("ERROR: Could not acquire storage lock for saving: {}", e);
-            }
+        let mut storage = shutdown_storage_manager.lock().await;
+        if let Err(e) = storage.save(DB_FILE_PATH) {
+            eprintln!(
+                "ERROR: Failed to save database to '{}': {}",
+                DB_FILE_PATH, e
+            );
+        } else {
+            println!("Database saved successfully to {}", DB_FILE_PATH);
         }
     });
 
@@ -414,15 +406,8 @@ async fn process_query(sql: &str, state: &AppState) -> serde_json::Value {
         }
     };
 
-    let mut storage_guard = match state.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => {
-            eprintln!("Storage lock poisoned: {}", poisoned);
-            return json!({
-                "error": true,
-                "message": "Internal server error: Cannot acquire storage lock"
-            });
-        }
+    let mut storage_guard = match state.lock().await {
+        storage => storage,
     };
 
     let mut executor = Executor::new(&mut *storage_guard);
@@ -439,4 +424,24 @@ async fn process_query(sql: &str, state: &AppState) -> serde_json::Value {
             "details": exec_err.to_string()
         }),
     }
+}
+
+async fn run_mysql_server(port: u16) -> Result<(), Box<dyn Error>> {
+    let initial_storage = match StorageManager::load(DB_FILE_PATH) {
+        Ok(s) => {
+            println!("Loaded database state from {}", DB_FILE_PATH);
+            s
+        }
+        Err(e) => {
+            eprintln!(
+                "WARN: Failed to load database state ('{}'), starting fresh: {}",
+                DB_FILE_PATH, e
+            );
+            StorageManager::new()
+        }
+    };
+    let storage_manager = Arc::new(Mutex::new(initial_storage));
+
+    println!("Starting MySQL protocol compatible server on port {}", port);
+    mysql::server::run_server(port, storage_manager).await
 }

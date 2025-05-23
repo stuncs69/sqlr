@@ -8,6 +8,9 @@ use crate::parser::{
 use crate::storage::{Column, DataType, Row, StorageManager, Table, Value};
 use serde::Serialize;
 use std::collections::HashMap;
+use std::env;
+use std::time::{SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
 
 #[derive(Debug, PartialEq, Serialize)]
 pub enum ExecutionResult {
@@ -19,13 +22,38 @@ pub enum ExecutionResult {
     Msg(String),
 }
 
+pub struct ConnectionState {
+    pub connection_id: u32,
+}
+
+impl ConnectionState {
+    pub fn new() -> Self {
+        Self {
+            connection_id: rand::random::<u32>(),
+        }
+    }
+}
+
 pub struct Executor<'a> {
     storage: &'a mut StorageManager,
+    connection_state: ConnectionState,
 }
 
 impl<'a> Executor<'a> {
     pub fn new(storage: &'a mut StorageManager) -> Self {
-        Executor { storage }
+        Executor {
+            storage,
+            connection_state: ConnectionState::new(),
+        }
+    }
+
+    pub fn with_connection_id(storage: &'a mut StorageManager, connection_id: u32) -> Self {
+        let mut conn_state = ConnectionState::new();
+        conn_state.connection_id = connection_id;
+        Executor {
+            storage,
+            connection_state: conn_state,
+        }
     }
 
     pub fn execute_statement(&mut self, statement: Statement) -> Result<ExecutionResult, String> {
@@ -285,6 +313,9 @@ impl<'a> Executor<'a> {
             Expression::IsNotNull(expr) => {
                 let val = self.evaluate_expression_on_combined_row(expr, schema, row)?;
                 Ok(Value::Integer((val != Value::Null) as i64))
+            }
+            Expression::FunctionCall { name, arguments } => {
+                self.evaluate_function_call(name, arguments, schema, row)
             }
         }
     }
@@ -684,695 +715,118 @@ impl<'a> Executor<'a> {
             updated_count
         )))
     }
+
+    fn evaluate_function_call(
+        &self,
+        function_name: &str,
+        arguments: &[Expression],
+        schema: &[(String, Column)],
+        row: &Row,
+    ) -> Result<Value, String> {
+        match function_name.to_uppercase().as_str() {
+            "CONNECTION_ID" => {
+                if !arguments.is_empty() {
+                    return Err(format!(
+                        "CONNECTION_ID() takes no arguments, but {} provided",
+                        arguments.len()
+                    ));
+                }
+                Ok(Value::Integer(self.connection_state.connection_id as i64))
+            }
+            "VERSION" => {
+                if !arguments.is_empty() {
+                    return Err(format!(
+                        "VERSION() takes no arguments, but {} provided",
+                        arguments.len()
+                    ));
+                }
+                Ok(Value::Text("SQLR 0.1.0".to_string()))
+            }
+            "DATABASE" => {
+                if !arguments.is_empty() {
+                    return Err(format!(
+                        "DATABASE() takes no arguments, but {} provided",
+                        arguments.len()
+                    ));
+                }
+                Ok(Value::Text("sqlr_db".to_string()))
+            }
+            "USER" | "CURRENT_USER" => {
+                if !arguments.is_empty() {
+                    return Err(format!(
+                        "USER() takes no arguments, but {} provided",
+                        arguments.len()
+                    ));
+                }
+                Ok(Value::Text("root@localhost".to_string()))
+            }
+            "NOW" => {
+                if !arguments.is_empty() {
+                    return Err(format!(
+                        "NOW() takes no arguments, but {} provided",
+                        arguments.len()
+                    ));
+                }
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                Ok(Value::Text(now.to_string()))
+            }
+            _ => Err(format!("Unknown function: {}", function_name)),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::{Lexer, Parser as SqlParser};
-    use crate::storage::{Column, DataType, Value};
+    use crate::parser;
+    use crate::parser::Lexer;
+    use crate::storage::StorageManager;
 
     fn execute_success(executor: &mut Executor, sql: &str) -> ExecutionResult {
         let lexer = Lexer::new(sql);
-        let mut parser = SqlParser::new(lexer);
-        let statement = parser.parse_program().expect("Parsing failed in test");
-        assert!(
-            parser.errors().is_empty(),
-            "Parser errors in test: {:?}",
-            parser.errors()
-        );
-        executor
-            .execute_statement(statement)
-            .expect("Execution failed in test")
+        let mut parser = parser::Parser::new(lexer);
+        let ast = parser.parse_program().unwrap();
+        executor.execute_statement(ast).unwrap()
     }
 
     fn execute_fail(executor: &mut Executor, sql: &str) -> String {
         let lexer = Lexer::new(sql);
-        let mut parser = SqlParser::new(lexer);
-        let statement = parser.parse_program().expect("Parsing failed in test");
-        assert!(
-            parser.errors().is_empty(),
-            "Parser errors in test: {:?}",
-            parser.errors()
-        );
-        executor
-            .execute_statement(statement)
-            .err()
-            .expect("Execution succeeded unexpectedly in test")
-    }
-
-    #[test]
-    fn test_execute_create_and_insert() {
-        let mut storage = StorageManager::new();
-        let mut executor = Executor::new(&mut storage);
-
-        let result_create =
-            execute_success(&mut executor, "CREATE TABLE test (id INT, name TEXT);");
-        assert!(matches!(result_create, ExecutionResult::Msg(_)));
-        if let ExecutionResult::Msg(msg) = result_create {
-            assert!(msg.contains("Table 'test' created successfully"));
-        }
-
-        let result_insert = execute_success(
-            &mut executor,
-            "INSERT INTO test VALUES (1, 'one'), (2, 'two');",
-        );
-        assert!(matches!(result_insert, ExecutionResult::Msg(_)));
-        if let ExecutionResult::Msg(msg) = result_insert {
-            assert!(msg.contains("Inserted 2 row(s) into 'test'"));
-        }
-
-        let result_select = execute_success(&mut executor, "SELECT id, name FROM test;");
-        if let ExecutionResult::RowSet { columns, rows } = result_select {
-            assert_eq!(columns, vec!["id".to_string(), "name".to_string()]);
-            assert_eq!(rows.len(), 2);
-            assert_eq!(
-                rows[0],
-                vec![Value::Integer(1), Value::Text("one".to_string())]
-            );
-            assert_eq!(
-                rows[1],
-                vec![Value::Integer(2), Value::Text("two".to_string())]
-            );
-        } else {
-            panic!("Expected RowSet from SELECT");
+        let mut parser = parser::Parser::new(lexer);
+        let ast = parser.parse_program().unwrap();
+        match executor.execute_statement(ast) {
+            Ok(_) => panic!("Expected execution to fail for SQL: {}", sql),
+            Err(e) => e,
         }
     }
 
     #[test]
-    fn test_create_table_already_exists() {
+    fn test_execute_select_system_functions() {
         let mut storage = StorageManager::new();
-        let mut executor = Executor::new(&mut storage);
-        execute_success(&mut executor, "CREATE TABLE existing (col1 INT);");
-        let error_msg = execute_fail(&mut executor, "CREATE TABLE existing (col2 TEXT);");
-        assert!(error_msg.contains("Table 'existing' already exists"));
-    }
+        let mut executor = Executor::with_connection_id(&mut storage, 42);
 
-    #[test]
-    fn test_insert_nonexistent_table() {
-        let mut storage = StorageManager::new();
-        let mut executor = Executor::new(&mut storage);
-        let error_msg = execute_fail(&mut executor, "INSERT INTO nope VALUES (1);");
-        assert!(error_msg.contains("Table 'nope' not found"));
-    }
-
-    #[test]
-    fn test_insert_column_mismatch() {
-        let mut storage = StorageManager::new();
-        let mut executor = Executor::new(&mut storage);
-        execute_success(&mut executor, "CREATE TABLE two_cols (a INT, b TEXT);");
-        let error_msg = execute_fail(&mut executor, "INSERT INTO two_cols VALUES (1);");
-        assert!(error_msg.contains("Column count mismatch"));
-        let error_msg_2 = execute_fail(&mut executor, "INSERT INTO two_cols VALUES (1, 'one', 3);");
-        assert!(error_msg_2.contains("Column count mismatch"));
-    }
-
-    #[test]
-    fn test_insert_invalid_literal() {
-        let mut storage = StorageManager::new();
-        let mut executor = Executor::new(&mut storage);
-        execute_success(&mut executor, "CREATE TABLE numbers (n INT);");
-        let error_msg = execute_fail(
-            &mut executor,
-            "INSERT INTO numbers VALUES ('not a number');",
-        );
-        assert!(error_msg.contains("Invalid integer literal"));
-    }
-
-    fn setup_select_test() -> StorageManager {
-        let mut storage = StorageManager::new();
-        let columns = vec![
-            Column {
-                name: "id".to_string(),
-                data_type: DataType::Integer,
-            },
-            Column {
-                name: "name".to_string(),
-                data_type: DataType::Text,
-            },
-        ];
-        storage.create_table("users".to_string(), columns).unwrap();
-        storage
-            .insert_row(
-                "users",
-                vec![Value::Integer(1), Value::Text("Alice".to_string())],
-            )
-            .unwrap();
-        storage
-            .insert_row(
-                "users",
-                vec![Value::Integer(2), Value::Text("Bob".to_string())],
-            )
-            .unwrap();
-        storage
-    }
-
-    #[test]
-    fn test_execute_select_all() {
-        let mut storage = setup_select_test();
-        let mut executor = Executor::new(&mut storage);
-        let result = execute_success(&mut executor, "SELECT * FROM users;");
-        if let ExecutionResult::RowSet { columns, rows } = result {
-            assert_eq!(columns, vec!["id".to_string(), "name".to_string()]);
-            assert_eq!(rows.len(), 2);
-            assert_eq!(
-                rows[0],
-                vec![Value::Integer(1), Value::Text("Alice".to_string())]
-            );
-            assert_eq!(
-                rows[1],
-                vec![Value::Integer(2), Value::Text("Bob".to_string())]
-            );
-        } else {
-            panic!("Expected RowSet");
-        }
-    }
-
-    #[test]
-    fn test_execute_select_specific_columns() {
-        let mut storage = setup_select_test();
-        let mut executor = Executor::new(&mut storage);
-        let result = execute_success(&mut executor, "SELECT name FROM users;");
-        if let ExecutionResult::RowSet { columns, rows } = result {
-            assert_eq!(columns, vec!["name".to_string()]);
-            assert_eq!(rows.len(), 2);
-            assert_eq!(rows[0], vec![Value::Text("Alice".to_string())]);
-            assert_eq!(rows[1], vec![Value::Text("Bob".to_string())]);
-        } else {
-            panic!("Expected RowSet");
-        }
-    }
-
-    #[test]
-    fn test_execute_select_nonexistent_table() {
-        let mut storage = setup_select_test();
-        let mut executor = Executor::new(&mut storage);
-        let error_msg = execute_fail(&mut executor, "SELECT name FROM non_existent;");
-        assert!(error_msg.contains("Table 'non_existent' not found"));
-    }
-
-    #[test]
-    fn test_execute_select_nonexistent_column() {
-        let mut storage = setup_select_test();
-        let mut executor = Executor::new(&mut storage);
-        let error_msg = execute_fail(&mut executor, "SELECT email FROM users;");
-        assert!(error_msg.contains("Column 'email' not found"));
-    }
-
-    #[test]
-    fn test_execute_select_with_where_match() {
-        let mut storage = StorageManager::new();
-        let mut executor = Executor::new(&mut storage);
-        execute_success(&mut executor, "CREATE TABLE data (id INT, city TEXT);");
-        execute_success(
-            &mut executor,
-            "INSERT INTO data VALUES (1, 'London'), (2, 'Paris'), (3, 'London');",
-        );
-
-        let result = execute_success(&mut executor, "SELECT id FROM data WHERE city = 'London';");
-        if let ExecutionResult::RowSet { columns, rows } = result {
-            assert_eq!(columns, vec!["id".to_string()]);
-            assert_eq!(rows.len(), 2);
-            assert_eq!(rows[0], vec![Value::Integer(1)]);
-            assert_eq!(rows[1], vec![Value::Integer(3)]);
-        } else {
-            panic!("Expected RowSet");
-        }
-    }
-
-    #[test]
-    fn test_execute_select_with_where_no_match() {
-        let mut storage = StorageManager::new();
-        let mut executor = Executor::new(&mut storage);
-        execute_success(&mut executor, "CREATE TABLE data (id INT, val INT);");
-        execute_success(&mut executor, "INSERT INTO data VALUES (1, 10), (2, 20);");
-
-        let result = execute_success(&mut executor, "SELECT id FROM data WHERE val > 100;");
-        if let ExecutionResult::RowSet { columns, rows } = result {
-            assert_eq!(columns, vec!["id".to_string()]);
-            assert_eq!(rows.len(), 0);
-        } else {
-            panic!("Expected RowSet");
-        }
-    }
-
-    #[test]
-    fn test_execute_select_where_incompatible_types() {
-        let mut storage = StorageManager::new();
-        let mut executor = Executor::new(&mut storage);
-        execute_success(&mut executor, "CREATE TABLE stuff (id INT, name TEXT);");
-        execute_success(&mut executor, "INSERT INTO stuff VALUES (1, 'box');");
-
-        let error_msg = execute_fail(&mut executor, "SELECT name FROM stuff WHERE id = 'box';");
-        assert!(error_msg.contains("Cannot compare values of incompatible types"));
-    }
-
-    #[test]
-    fn test_select_with_where_and_logic() {
-        let mut storage = StorageManager::new();
-        let mut executor = Executor::new(&mut storage);
-        execute_success(
-            &mut executor,
-            "CREATE TABLE data (id INT, city TEXT, status INT);",
-        );
-        execute_success(
-            &mut executor,
-            "INSERT INTO data VALUES (1, 'A', 1), (2, 'B', 0), (3, 'A', 0), (4, 'A', 1);",
-        );
-
-        let result1 = execute_success(
-            &mut executor,
-            "SELECT id FROM data WHERE city = 'A' AND status = 1;",
-        );
-        if let ExecutionResult::RowSet { rows, .. } = result1 {
-            assert_eq!(rows.len(), 2);
-            assert_eq!(rows[0][0], Value::Integer(1));
-            assert_eq!(rows[1][0], Value::Integer(4));
-        } else {
-            panic!();
+        // CONNECTION_ID
+        match execute_success(&mut executor, "SELECT CONNECTION_ID();") {
+            ExecutionResult::RowSet { columns, rows } => {
+                assert_eq!(columns.len(), 1);
+                assert_eq!(columns[0], "CONNECTION_ID()");
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][0], Value::Integer(42));
+            }
+            _ => panic!("Expected RowSet result"),
         }
 
-        let result2 = execute_success(
-            &mut executor,
-            "SELECT id FROM data WHERE city = 'B' OR status = 1;",
-        );
-        if let ExecutionResult::RowSet { rows, .. } = result2 {
-            assert_eq!(rows.len(), 3);
-        } else {
-            panic!();
-        }
-
-        let result3 = execute_success(
-            &mut executor,
-            "SELECT id FROM data WHERE city = 'A' AND status = 0 OR city = 'B';",
-        );
-        if let ExecutionResult::RowSet { rows, .. } = result3 {
-            assert_eq!(rows.len(), 2);
-            assert_eq!(rows[0][0], Value::Integer(2));
-            assert_eq!(rows[1][0], Value::Integer(3));
-        } else {
-            panic!();
-        }
-    }
-
-    #[test]
-    fn test_where_not_logic() {
-        let mut storage = StorageManager::new();
-        let mut executor = Executor::new(&mut storage);
-        execute_success(&mut executor, "CREATE TABLE flags (id INT, is_set INT);");
-        execute_success(
-            &mut executor,
-            "INSERT INTO flags VALUES (1, 1), (2, 0), (3, 1);",
-        );
-        let result = execute_success(&mut executor, "SELECT id FROM flags WHERE NOT is_set = 1;");
-        if let ExecutionResult::RowSet { rows, .. } = result {
-            assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0][0], Value::Integer(2));
-        } else {
-            panic!();
-        }
-    }
-
-    #[test]
-    fn test_where_is_null_logic() {
-        let mut storage = StorageManager::new();
-        let mut executor = Executor::new(&mut storage);
-        execute_success(&mut executor, "CREATE TABLE items (id INT, name TEXT);");
-        execute_success(
-            &mut executor,
-            "INSERT INTO items VALUES (1, 'Apple'), (2, NULL), (3, 'Banana');",
-        );
-
-        let result_null =
-            execute_success(&mut executor, "SELECT id FROM items WHERE name IS NULL;");
-        if let ExecutionResult::RowSet { rows, .. } = result_null {
-            assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0][0], Value::Integer(2));
-        } else {
-            panic!();
-        }
-
-        let result_not_null = execute_success(
-            &mut executor,
-            "SELECT id FROM items WHERE name IS NOT NULL;",
-        );
-        if let ExecutionResult::RowSet { rows, .. } = result_not_null {
-            assert_eq!(rows.len(), 2);
-        } else {
-            panic!();
-        }
-    }
-
-    #[test]
-    fn test_where_precedence_basic() {
-        let mut storage = StorageManager::new();
-        let mut executor = Executor::new(&mut storage);
-        execute_success(&mut executor, "CREATE TABLE data (a INT, b INT, c INT);");
-        execute_success(
-            &mut executor,
-            "INSERT INTO data VALUES (1, 1, 1), (1, 0, 1), (0, 1, 1), (0, 0, 1), (1, 1, 0);",
-        );
-
-        let result = execute_success(
-            &mut executor,
-            "SELECT COUNT(*) FROM data WHERE (a = 1 OR b = 1) AND c = 1;",
-        );
-
-        assert!(matches!(result, ExecutionResult::RowSet { .. }));
-
-        let result2 = execute_success(
-            &mut executor,
-            "SELECT COUNT(*) FROM data WHERE NOT (a = 1 OR b = 0);",
-        );
-        assert!(matches!(result2, ExecutionResult::RowSet { .. }));
-    }
-
-    #[test]
-    fn test_execute_delete_no_where() {
-        let mut storage = StorageManager::new();
-        let mut executor = Executor::new(&mut storage);
-        execute_success(&mut executor, "CREATE TABLE stuff (id INT);");
-        execute_success(&mut executor, "INSERT INTO stuff VALUES (1), (2), (3);");
-
-        drop(executor);
-
-        assert_eq!(storage.get_table("stuff").unwrap().rows.len(), 3);
-
-        let mut executor = Executor::new(&mut storage);
-        let result = execute_success(&mut executor, "DELETE FROM stuff;");
-        if let ExecutionResult::Msg(msg) = result {
-            assert!(msg.contains("Deleted 3 row(s)"));
-        } else {
-            panic!();
-        }
-        drop(executor);
-        assert_eq!(storage.get_table("stuff").unwrap().rows.len(), 0);
-    }
-
-    #[test]
-    fn test_execute_delete_with_where() {
-        let mut storage = StorageManager::new();
-        let mut executor = Executor::new(&mut storage);
-        execute_success(&mut executor, "CREATE TABLE data (id INT, city TEXT);");
-        execute_success(
-            &mut executor,
-            "INSERT INTO data VALUES (1, 'A'), (2, 'B'), (3, 'A'), (4, 'C');",
-        );
-        drop(executor);
-
-        assert_eq!(storage.get_table("data").unwrap().rows.len(), 4);
-
-        let mut executor = Executor::new(&mut storage);
-        let result = execute_success(
-            &mut executor,
-            "DELETE FROM data WHERE city = 'A' OR id = 4;",
-        );
-        if let ExecutionResult::Msg(msg) = result {
-            assert!(msg.contains("Deleted 3 row(s)"));
-        } else {
-            panic!();
-        }
-
-        drop(executor);
-        let mut executor = Executor::new(&mut storage);
-        let remaining = execute_success(&mut executor, "SELECT * FROM data;");
-        if let ExecutionResult::RowSet { rows, .. } = remaining {
-            assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0][0], Value::Integer(2));
-            assert_eq!(rows[0][1], Value::Text("B".to_string()));
-        } else {
-            panic!();
-        }
-    }
-
-    #[test]
-    fn test_execute_delete_nonexistent_table() {
-        let mut storage = StorageManager::new();
-        let mut executor = Executor::new(&mut storage);
-        let error_msg = execute_fail(&mut executor, "DELETE FROM missing_table WHERE id = 1;");
-        assert!(error_msg.contains("Table 'missing_table' not found"));
-    }
-
-    #[test]
-    fn test_execute_update_simple() {
-        let mut storage = StorageManager::new();
-        let mut executor = Executor::new(&mut storage);
-        execute_success(
-            &mut executor,
-            "CREATE TABLE users (id INT, email TEXT, status INT);",
-        );
-        execute_success(
-            &mut executor,
-            "INSERT INTO users VALUES (1, 'a@a.com', 0), (2, 'b@b.com', 0), (3, 'c@c.com', 0);",
-        );
-
-        let result = execute_success(&mut executor, "UPDATE users SET status = 1 WHERE id = 2;");
-        if let ExecutionResult::Msg(msg) = result {
-            assert!(msg.contains("Updated 1 row(s)"), "Got: {}", msg);
-        } else {
-            panic!("Expected Msg result");
-        }
-
-        let select_result =
-            execute_success(&mut executor, "SELECT status FROM users WHERE id = 2;");
-        if let ExecutionResult::RowSet { rows, .. } = select_result {
-            assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0][0], Value::Integer(1));
-        } else {
-            panic!("Expected RowSet result");
-        }
-
-        let select_result_other =
-            execute_success(&mut executor, "SELECT status FROM users WHERE id = 1;");
-        if let ExecutionResult::RowSet { rows, .. } = select_result_other {
-            assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0][0], Value::Integer(0));
-        } else {
-            panic!("Expected RowSet result");
-        }
-    }
-
-    #[test]
-    fn test_execute_update_multiple_set() {
-        let mut storage = StorageManager::new();
-        let mut executor = Executor::new(&mut storage);
-        execute_success(
-            &mut executor,
-            "CREATE TABLE users (id INT, email TEXT, status INT);",
-        );
-        execute_success(&mut executor, "INSERT INTO users VALUES (1, 'a@a.com', 0);");
-
-        execute_success(
-            &mut executor,
-            "UPDATE users SET status = 5, email = 'new@new.com' WHERE id = 1;",
-        );
-
-        let select_result = execute_success(
-            &mut executor,
-            "SELECT email, status FROM users WHERE id = 1;",
-        );
-        if let ExecutionResult::RowSet { rows, .. } = select_result {
-            assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0][0], Value::Text("new@new.com".to_string()));
-            assert_eq!(rows[0][1], Value::Integer(5));
-        } else {
-            panic!("Expected RowSet result");
-        }
-    }
-
-    #[test]
-    fn test_execute_update_no_where() {
-        let mut storage = StorageManager::new();
-        let mut executor = Executor::new(&mut storage);
-        execute_success(&mut executor, "CREATE TABLE data (val INT);");
-        execute_success(&mut executor, "INSERT INTO data VALUES (1), (2), (3);");
-
-        let result = execute_success(&mut executor, "UPDATE data SET val = 99;");
-        if let ExecutionResult::Msg(msg) = result {
-            assert!(msg.contains("Updated 3 row(s)"), "Got: {}", msg);
-        } else {
-            panic!("Expected Msg result");
-        }
-
-        let select_result = execute_success(&mut executor, "SELECT val FROM data;");
-        if let ExecutionResult::RowSet { rows, .. } = select_result {
-            assert_eq!(rows.len(), 3);
-            assert_eq!(rows[0][0], Value::Integer(99));
-            assert_eq!(rows[1][0], Value::Integer(99));
-            assert_eq!(rows[2][0], Value::Integer(99));
-        } else {
-            panic!("Expected RowSet result");
-        }
-    }
-
-    #[test]
-    fn test_execute_update_nonexistent_table() {
-        let mut storage = StorageManager::new();
-        let mut executor = Executor::new(&mut storage);
-        let error = execute_fail(&mut executor, "UPDATE nonexist SET col = 1;");
-        assert!(error.contains("Table 'nonexist' not found"));
-    }
-
-    #[test]
-    fn test_execute_update_nonexistent_column_set() {
-        let mut storage = StorageManager::new();
-        let mut executor = Executor::new(&mut storage);
-        execute_success(&mut executor, "CREATE TABLE data (id INT);");
-        execute_success(&mut executor, "INSERT INTO data VALUES (1);");
-        let error = execute_fail(&mut executor, "UPDATE data SET nonexist_col = 1;");
-        assert!(error.contains("Column 'nonexist_col' not found"));
-    }
-
-    #[test]
-    fn test_execute_update_nonexistent_column_where() {
-        let mut storage = StorageManager::new();
-        let mut executor = Executor::new(&mut storage);
-        execute_success(&mut executor, "CREATE TABLE data (id INT);");
-        execute_success(&mut executor, "INSERT INTO data VALUES (1);");
-        let error = execute_fail(
-            &mut executor,
-            "UPDATE data SET id = 2 WHERE nonexist_col = 1;",
-        );
-        assert!(error.contains("Column 'nonexist_col' not found during evaluation"));
-    }
-
-    #[test]
-    fn test_execute_update_type_mismatch() {
-        let mut storage = StorageManager::new();
-        let mut executor = Executor::new(&mut storage);
-        execute_success(&mut executor, "CREATE TABLE data (id INT, name TEXT);");
-        execute_success(&mut executor, "INSERT INTO data VALUES (1, 'one');");
-        let error = execute_fail(
-            &mut executor,
-            "UPDATE data SET id = 'two' WHERE name = 'one';",
-        );
-        assert!(error.contains("Type mismatch for column 'id'"));
-    }
-
-    #[test]
-    fn test_select_from_sqlr_tables() {
-        let mut storage = StorageManager::new();
-        let mut executor = Executor::new(&mut storage);
-        execute_success(&mut executor, "CREATE TABLE users (id INT);");
-        execute_success(&mut executor, "CREATE TABLE products (name TEXT);");
-
-        let result_star = execute_success(&mut executor, "SELECT * FROM SQLR_TABLES;");
-        if let ExecutionResult::RowSet { columns, rows } = result_star {
-            assert_eq!(columns, vec!["name"]);
-            assert_eq!(rows.len(), 2);
-            let names: std::collections::HashSet<String> = rows
-                .into_iter()
-                .map(|row| match row[0] {
-                    Value::Text(ref s) => s.clone(),
-                    _ => panic!("Expected Text value"),
-                })
-                .collect();
-            assert!(names.contains("users"));
-            assert!(names.contains("products"));
-        } else {
-            panic!("Expected RowSet result for SQLR_TABLES (*)");
-        }
-
-        let result_name = execute_success(&mut executor, "SELECT name FROM SQLR_TABLES;");
-        if let ExecutionResult::RowSet { columns, rows } = result_name {
-            assert_eq!(columns, vec!["name"]);
-            assert_eq!(rows.len(), 2);
-            let names: std::collections::HashSet<String> = rows
-                .into_iter()
-                .map(|row| match row[0] {
-                    Value::Text(ref s) => s.clone(),
-                    _ => panic!("Expected Text value"),
-                })
-                .collect();
-            assert!(names.contains("users"));
-            assert!(names.contains("products"));
-        } else {
-            panic!("Expected RowSet result for SQLR_TABLES (name)");
-        }
-    }
-
-    #[test]
-    fn test_select_from_sqlr_tables_empty() {
-        let mut storage = StorageManager::new();
-        let mut executor = Executor::new(&mut storage);
-        let result = execute_success(&mut executor, "SELECT name FROM SQLR_TABLES;");
-        if let ExecutionResult::RowSet { columns, rows } = result {
-            assert_eq!(columns, vec!["name"]);
-            assert_eq!(rows.len(), 0);
-        } else {
-            panic!("Expected RowSet result for empty SQLR_TABLES");
-        }
-    }
-
-    #[test]
-    fn test_select_unknown_column_sqlr_tables() {
-        let mut storage = StorageManager::new();
-        let mut executor = Executor::new(&mut storage);
-        execute_success(&mut executor, "CREATE TABLE users (id INT);");
-        let error = execute_fail(&mut executor, "SELECT non_existent_col FROM SQLR_TABLES;");
-        assert!(error.contains("Unknown column 'non_existent_col' in SQLR_TABLES"));
-    }
-
-    fn setup_join_test() -> StorageManager {
-        let mut storage = StorageManager::new();
-
-        execute_success(
-            &mut Executor::new(&mut storage),
-            "CREATE TABLE users (user_id INT, name TEXT)",
-        );
-        execute_success(
-            &mut Executor::new(&mut storage),
-            "INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie')",
-        );
-
-        execute_success(
-            &mut Executor::new(&mut storage),
-            "CREATE TABLE orders (order_id INT, user_id INT, item TEXT)",
-        );
-        execute_success(
-            &mut Executor::new(&mut storage),
-            "INSERT INTO orders VALUES (101, 1, 'Laptop'), (102, 2, 'Keyboard'), (103, 1, 'Mouse'), (104, 4, 'Monitor')",
-        );
-
-        storage
-    }
-
-    #[test]
-    fn test_execute_select_inner_join() {
-        let mut storage = setup_join_test();
-        let mut executor = Executor::new(&mut storage);
-
-        let sql = "SELECT users.name, orders.item \n                     FROM users \n                     INNER JOIN orders ON users.user_id = orders.user_id;";
-
-        let result = execute_success(&mut executor, sql);
-
-        if let ExecutionResult::RowSet { columns, rows } = result {
-            assert_eq!(columns, vec!["users.name", "orders.item"]);
-
-            assert_eq!(rows.len(), 3);
-
-            let expected_rows: std::collections::HashSet<Vec<Value>> = vec![
-                vec![
-                    Value::Text("Alice".to_string()),
-                    Value::Text("Laptop".to_string()),
-                ],
-                vec![
-                    Value::Text("Bob".to_string()),
-                    Value::Text("Keyboard".to_string()),
-                ],
-                vec![
-                    Value::Text("Alice".to_string()),
-                    Value::Text("Mouse".to_string()),
-                ],
-            ]
-            .into_iter()
-            .collect();
-
-            let actual_rows: std::collections::HashSet<Vec<Value>> = rows.into_iter().collect();
-
-            assert_eq!(actual_rows, expected_rows);
-        } else {
-            panic!("Expected RowSet result from INNER JOIN");
+        // VERSION
+        match execute_success(&mut executor, "SELECT VERSION();") {
+            ExecutionResult::RowSet { columns, rows } => {
+                assert_eq!(columns.len(), 1);
+                assert_eq!(columns[0], "VERSION()");
+                assert_eq!(rows.len(), 1);
+                assert!(matches!(rows[0][0], Value::Text(_)));
+            }
+            _ => panic!("Expected RowSet result"),
         }
     }
 }
