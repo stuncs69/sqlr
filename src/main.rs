@@ -75,6 +75,22 @@ fn run_parser_repl() {
                     continue;
                 }
 
+                if trimmed_input.eq_ignore_ascii_case("health") {
+                    let health = storage.get_health_metrics();
+                    println!("Health Status: healthy");
+                    println!("  Uptime: {} seconds", health.uptime_seconds);
+                    println!("  Total Tables: {}", health.total_tables);
+                    println!("  Total Rows: {}", health.total_rows);
+                    println!("  Queries Executed: {}", health.queries_executed);
+                    if let Some(time) = health.last_query_time_ms {
+                        println!("  Last Query Time: {} ms", time);
+                    }
+                    println!("  Version: SQLR 0.1.0");
+                    continue;
+                }
+
+                let start = std::time::Instant::now();
+
                 let lexer = Lexer::new(trimmed_input);
                 let mut parser = Parser::new(lexer);
                 let program = parser.parse_program();
@@ -91,6 +107,9 @@ fn run_parser_repl() {
                             let mut executor = Executor::new(&mut storage);
                             match executor.execute_statement(stmt) {
                                 Ok(result) => {
+                                    let duration_ms = start.elapsed().as_millis() as u64;
+                                    storage.record_query_execution(duration_ms);
+
                                     println!("Execution Result:");
 
                                     match result {
@@ -105,6 +124,7 @@ fn run_parser_repl() {
                                             println!("{}", msg);
                                         }
                                     }
+                                    println!("Execution time: {} ms", duration_ms);
                                 }
                                 Err(exec_err) => {
                                     println!("Execution Error: {}", exec_err);
@@ -169,6 +189,7 @@ async fn run_web_ui() -> Result<(), Box<dyn Error>> {
 
     let app = Router::new()
         .route("/api/query", post(handle_api_query))
+        .route("/api/health", axum::routing::get(handle_health_check))
         .nest_service("/", ServeDir::new("web"))
         .with_state(storage_manager.clone());
 
@@ -213,6 +234,8 @@ async fn handle_api_query(
         return Err((StatusCode::BAD_REQUEST, "Query cannot be empty".to_string()));
     }
 
+    let start = std::time::Instant::now();
+
     let lexer = Lexer::new(sql);
     let mut parser = Parser::new(lexer);
     let program = parser.parse_program();
@@ -239,16 +262,40 @@ async fn handle_api_query(
 
     let mut executor = Executor::new(&mut *storage_guard);
 
-    match executor.execute_statement(statement) {
-        Ok(result) => Ok(Json(json!({
-            "error": false,
-            "message": "Execution successful",
-            "result": result
-        }))),
+    let result = match executor.execute_statement(statement) {
+        Ok(result) => {
+            let duration_ms = start.elapsed().as_millis() as u64;
+            storage_guard.record_query_execution(duration_ms);
+            Ok(Json(json!({
+                "error": false,
+                "message": "Execution successful",
+                "result": result,
+                "execution_time_ms": duration_ms
+            })))
+        }
         Err(exec_err) => Ok(Json(
             json!({ "error": true, "message": "Execution Error", "details": exec_err }),
         )),
-    }
+    };
+
+    result
+}
+
+async fn handle_health_check(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let storage_guard = state.lock().await;
+    let health = storage_guard.get_health_metrics();
+
+    Ok(Json(json!({
+        "status": "healthy",
+        "uptime_seconds": health.uptime_seconds,
+        "total_tables": health.total_tables,
+        "total_rows": health.total_rows,
+        "queries_executed": health.queries_executed,
+        "last_query_time_ms": health.last_query_time_ms,
+        "version": "SQLR 0.1.0"
+    })))
 }
 
 async fn run_tcp_server() -> Result<(), Box<dyn Error>> {
@@ -382,6 +429,26 @@ async fn handle_connection(mut stream: TcpStream, state: AppState) {
 }
 
 async fn process_query(sql: &str, state: &AppState) -> serde_json::Value {
+    if sql.eq_ignore_ascii_case("HEALTH") {
+        let storage_guard = state.lock().await;
+        let health = storage_guard.get_health_metrics();
+        return json!({
+            "error": false,
+            "message": "Health check successful",
+            "result": {
+                "status": "healthy",
+                "uptime_seconds": health.uptime_seconds,
+                "total_tables": health.total_tables,
+                "total_rows": health.total_rows,
+                "queries_executed": health.queries_executed,
+                "last_query_time_ms": health.last_query_time_ms,
+                "version": "SQLR 0.1.0"
+            }
+        });
+    }
+
+    let start = std::time::Instant::now();
+
     let lexer = Lexer::new(sql);
     let mut parser = Parser::new(lexer);
     let program = parser.parse_program();
@@ -413,11 +480,16 @@ async fn process_query(sql: &str, state: &AppState) -> serde_json::Value {
     let mut executor = Executor::new(&mut *storage_guard);
 
     match executor.execute_statement(statement) {
-        Ok(result) => json!({
-            "error": false,
-            "message": "Execution successful",
-            "result": result
-        }),
+        Ok(result) => {
+            let duration_ms = start.elapsed().as_millis() as u64;
+            storage_guard.record_query_execution(duration_ms);
+            json!({
+                "error": false,
+                "message": "Execution successful",
+                "result": result,
+                "execution_time_ms": duration_ms
+            })
+        }
         Err(exec_err) => json!({
             "error": true,
             "message": "Execution Error",

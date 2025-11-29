@@ -52,6 +52,19 @@ pub enum Token {
     As,
 
     Function(String),
+
+    OrderBy,
+    Order,
+    By,
+    Asc,
+    Desc,
+    Limit,
+    Offset,
+    Distinct,
+    GroupBy,
+    Group,
+    Having,
+    Drop,
 }
 
 pub struct Lexer<'a> {
@@ -152,6 +165,11 @@ impl<'a> Lexer<'a> {
             "NOW",
             "CURDATE",
             "CURTIME",
+            "COUNT",
+            "SUM",
+            "AVG",
+            "MIN",
+            "MAX",
         ];
 
         if common_functions.contains(&upper_ident.as_str()) {
@@ -183,6 +201,16 @@ impl<'a> Lexer<'a> {
             "OUTER" => Token::Outer,
             "ON" => Token::On,
             "AS" => Token::As,
+            "ORDER" => Token::Order,
+            "BY" => Token::By,
+            "ASC" => Token::Asc,
+            "DESC" => Token::Desc,
+            "LIMIT" => Token::Limit,
+            "OFFSET" => Token::Offset,
+            "DISTINCT" => Token::Distinct,
+            "GROUP" => Token::Group,
+            "HAVING" => Token::Having,
+            "DROP" => Token::Drop,
             _ => Token::Identifier(ident.to_string()),
         }
     }
@@ -422,9 +450,21 @@ pub struct FromClause {
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct SelectStatement {
+    pub distinct: bool,
     pub columns: Vec<SelectItem>,
     pub from_clause: Option<FromClause>,
     pub where_clause: Option<Expression>,
+    pub group_by: Vec<Expression>,
+    pub having: Option<Expression>,
+    pub order_by: Vec<OrderByClause>,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct OrderByClause {
+    pub expr: Expression,
+    pub ascending: bool,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -444,6 +484,12 @@ pub enum Statement {
     Insert(InsertStatement),
     Delete(DeleteStatement),
     Update(UpdateStatement),
+    DropTable(DropTableStatement),
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct DropTableStatement {
+    pub table_name: String,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -553,6 +599,7 @@ impl<'a> Parser<'a> {
             Token::Insert => self.parse_insert_statement(),
             Token::Delete => self.parse_delete_statement(),
             Token::Update => self.parse_update_statement(),
+            Token::Drop => self.parse_drop_table_statement(),
             Token::Eof => None,
             _ => {
                 self.errors.push(format!(
@@ -566,6 +613,13 @@ impl<'a> Parser<'a> {
 
     fn parse_select_statement(&mut self) -> Option<Statement> {
         self.next_token();
+
+        let distinct = if self.current_token_is(Token::Distinct) {
+            self.next_token();
+            true
+        } else {
+            false
+        };
 
         let columns = match self.parse_select_list() {
             Ok(cols) => cols,
@@ -600,14 +654,128 @@ impl<'a> Parser<'a> {
             }
         }
 
+        let mut group_by = Vec::new();
+        if self.current_token_is(Token::Group) {
+            self.next_token();
+            if !self.current_token_is(Token::By) {
+                self.errors.push("Expected BY after GROUP".to_string());
+                return None;
+            }
+            self.next_token();
+
+            loop {
+                match self.parse_expression(Precedence::Lowest) {
+                    Some(expr) => group_by.push(expr),
+                    None => {
+                        self.errors.push("Failed to parse GROUP BY expression".to_string());
+                        return None;
+                    }
+                }
+
+                if !self.current_token_is(Token::Comma) {
+                    break;
+                }
+                self.next_token();
+            }
+        }
+
+        let mut having = None;
+        if self.current_token_is(Token::Having) {
+            self.next_token();
+            having = self.parse_expression(Precedence::Lowest);
+            if having.is_none() {
+                self.errors.push("Failed to parse HAVING clause expression".to_string());
+                return None;
+            }
+        }
+
+        let mut order_by = Vec::new();
+        if self.current_token_is(Token::Order) {
+            self.next_token();
+            if !self.current_token_is(Token::By) {
+                self.errors.push("Expected BY after ORDER".to_string());
+                return None;
+            }
+            self.next_token();
+
+            loop {
+                let expr = match self.parse_expression(Precedence::Lowest) {
+                    Some(e) => e,
+                    None => {
+                        self.errors.push("Failed to parse ORDER BY expression".to_string());
+                        return None;
+                    }
+                };
+
+                let ascending = if self.current_token_is(Token::Asc) {
+                    self.next_token();
+                    true
+                } else if self.current_token_is(Token::Desc) {
+                    self.next_token();
+                    false
+                } else {
+                    true // Default to ascending
+                };
+
+                order_by.push(OrderByClause { expr, ascending });
+
+                if !self.current_token_is(Token::Comma) {
+                    break;
+                }
+                self.next_token();
+            }
+        }
+
+        let mut limit = None;
+        if self.current_token_is(Token::Limit) {
+            self.next_token();
+            if let Token::Number(num_str) = &self.current_token {
+                match num_str.parse::<usize>() {
+                    Ok(n) => limit = Some(n),
+                    Err(_) => {
+                        self.errors.push(format!("Invalid LIMIT value: {}", num_str));
+                        return None;
+                    }
+                }
+                self.next_token();
+            } else {
+                self.errors.push("Expected number after LIMIT".to_string());
+                return None;
+            }
+        }
+
+        let mut offset = None;
+        if self.current_token_is(Token::Offset) {
+            self.next_token();
+            if let Token::Number(num_str) = &self.current_token {
+                match num_str.parse::<usize>() {
+                    Ok(n) => offset = Some(n),
+                    Err(_) => {
+                        self.errors.push(format!("Invalid OFFSET value: {}", num_str));
+                        return None;
+                    }
+                }
+                self.next_token();
+            } else {
+                self.errors.push("Expected number after OFFSET".to_string());
+                return None;
+            }
+        }
+
         if self.current_token_is(Token::Semicolon) {
             self.next_token();
         }
 
         Some(Statement::Select(SelectStatement {
+            distinct,
             columns,
             from_clause: Some(from_clause),
             where_clause,
+            group_by,
+            having,
+            order_by,
+            limit,
+            offset,
         }))
     }
 
@@ -637,6 +805,8 @@ impl<'a> Parser<'a> {
             } else {
                 match self.parse_expression(Precedence::Lowest) {
                     Some(expr) => {
+                        self.next_token();
+
                         let mut alias = None;
                         if self.current_token_is(Token::As) {
                             self.next_token();
@@ -658,6 +828,11 @@ impl<'a> Parser<'a> {
                                     | Token::Comma
                                     | Token::Semicolon
                                     | Token::Eof
+                                    | Token::Group
+                                    | Token::Order
+                                    | Token::Limit
+                                    | Token::Offset
+                                    | Token::Having
                             ) {
                                 alias = Some(potential_alias.clone());
                                 self.next_token();
@@ -844,6 +1019,12 @@ impl<'a> Parser<'a> {
             Token::LeftParen => self.parse_grouped_expression(),
             Token::Not => self.parse_prefix_unary(),
             Token::Null => Some(Expression::Literal(LiteralValue::Null)),
+            Token::Asterisk => {
+                Some(Expression::QualifiedIdentifier(QualifiedIdentifier {
+                    table: None,
+                    identifier: "*".to_string(),
+                }))
+            }
             _ => None,
         }
     }
@@ -1402,6 +1583,30 @@ impl<'a> Parser<'a> {
         }
 
         Ok(FromClause { base_table, joins })
+    }
+
+    fn parse_drop_table_statement(&mut self) -> Option<Statement> {
+        if !self.peek_token_is(Token::Table) {
+            self.peek_error_current(Token::Table);
+            return None;
+        }
+        self.next_token();
+        self.next_token();
+
+        let table_name = match &self.current_token {
+            Token::Identifier(name) => name.clone(),
+            _ => {
+                self.current_error_expected(Token::Identifier("Identifier".to_string()));
+                return None;
+            }
+        };
+        self.next_token();
+
+        if self.current_token_is(Token::Semicolon) {
+            self.next_token();
+        }
+
+        Some(Statement::DropTable(DropTableStatement { table_name }))
     }
 }
 
