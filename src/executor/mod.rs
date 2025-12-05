@@ -1,10 +1,10 @@
 #![allow(dead_code)]
 
 use crate::parser::{
-    BinaryOperator, CreateTableStatement, DeleteStatement, DropTableStatement, Expression,
-    FromClause, InsertStatement, JoinClause, JoinType, LiteralValue as ParserLiteralValue,
-    OrderByClause, ParsedDataType, QualifiedIdentifier, SelectItem, Statement, UnaryOperator,
-    UpdateStatement,
+    BinaryOperator, CreateIndexStatement, CreateTableStatement, DeleteStatement,
+    DescribeStatement, DropIndexStatement, DropTableStatement, Expression, FromClause,
+    InsertStatement, JoinClause, JoinType, LiteralValue as ParserLiteralValue, OrderByClause,
+    ParsedDataType, QualifiedIdentifier, SelectItem, Statement, UnaryOperator, UpdateStatement,
 };
 use crate::storage::{Column, DataType, Row, StorageManager, Table, Value};
 use serde::Serialize;
@@ -65,6 +65,10 @@ impl<'a> Executor<'a> {
             Statement::Delete(delete_stmt) => self.execute_delete(delete_stmt),
             Statement::Update(update_stmt) => self.execute_update(update_stmt),
             Statement::DropTable(drop_stmt) => self.execute_drop_table(drop_stmt),
+            Statement::CreateIndex(create_idx_stmt) => self.execute_create_index(create_idx_stmt),
+            Statement::DropIndex(drop_idx_stmt) => self.execute_drop_index(drop_idx_stmt),
+            Statement::Describe(describe_stmt) => self.execute_describe(describe_stmt),
+            Statement::ShowTables => self.execute_show_tables(),
         }
     }
 
@@ -337,6 +341,25 @@ impl<'a> Executor<'a> {
                             ));
                         }
                     },
+                    BinaryOperator::Like | BinaryOperator::NotLike => {
+                        let matches = match (&left_val, &right_val) {
+                            (Value::Text(text), Value::Text(pattern)) => {
+                                Self::sql_like_match(text, pattern)
+                            }
+                            (Value::Null, _) | (_, Value::Null) => false,
+                            _ => {
+                                return Err(format!(
+                                    "LIKE requires text operands, got {:?} and {:?}",
+                                    left_val, right_val
+                                ))
+                            }
+                        };
+                        match op {
+                            BinaryOperator::Like => matches,
+                            BinaryOperator::NotLike => !matches,
+                            _ => unreachable!(),
+                        }
+                    }
                     BinaryOperator::And => match (left_val, right_val) {
                         (Value::Integer(l), Value::Integer(r)) => l != 0 && r != 0,
                         _ => false,
@@ -370,6 +393,58 @@ impl<'a> Executor<'a> {
             }
             Expression::FunctionCall { name, arguments } => {
                 self.evaluate_function_call(name, arguments, schema, row)
+            }
+            Expression::InList { expr, list, negated } => {
+                let expr_val = self.evaluate_expression_on_combined_row(expr, schema, row)?;
+                let mut found = false;
+                for item in list {
+                    let item_val = self.evaluate_expression_on_combined_row(item, schema, row)?;
+                    if expr_val == item_val {
+                        found = true;
+                        break;
+                    }
+                }
+                let result = if *negated { !found } else { found };
+                Ok(Value::Integer(result as i64))
+            }
+            Expression::Between { expr, low, high, negated } => {
+                let expr_val = self.evaluate_expression_on_combined_row(expr, schema, row)?;
+                let low_val = self.evaluate_expression_on_combined_row(low, schema, row)?;
+                let high_val = self.evaluate_expression_on_combined_row(high, schema, row)?;
+
+                let in_range = match (expr_val.partial_cmp(&low_val), expr_val.partial_cmp(&high_val)) {
+                    (Some(l_cmp), Some(h_cmp)) => {
+                        l_cmp != std::cmp::Ordering::Less && h_cmp != std::cmp::Ordering::Greater
+                    }
+                    _ => false,
+                };
+                let result = if *negated { !in_range } else { in_range };
+                Ok(Value::Integer(result as i64))
+            }
+            Expression::Case { operand, when_clauses, else_result } => {
+                for (condition, result) in when_clauses {
+                    let matches = if let Some(op) = operand {
+                        let op_val = self.evaluate_expression_on_combined_row(op, schema, row)?;
+                        let cond_val = self.evaluate_expression_on_combined_row(condition, schema, row)?;
+                        op_val == cond_val
+                    } else {
+                        let cond_val = self.evaluate_expression_on_combined_row(condition, schema, row)?;
+                        match cond_val {
+                            Value::Integer(i) => i != 0,
+                            _ => false,
+                        }
+                    };
+
+                    if matches {
+                        return self.evaluate_expression_on_combined_row(result, schema, row);
+                    }
+                }
+
+                if let Some(else_expr) = else_result {
+                    self.evaluate_expression_on_combined_row(else_expr, schema, row)
+                } else {
+                    Ok(Value::Null)
+                }
             }
         }
     }
@@ -1464,6 +1539,20 @@ impl<'a> Executor<'a> {
                         },
                         None => false,
                     },
+                    BinaryOperator::Like | BinaryOperator::NotLike => {
+                        let matches = match (&left_val, &right_val) {
+                            (Value::Text(text), Value::Text(pattern)) => {
+                                Self::sql_like_match(text, pattern)
+                            }
+                            (Value::Null, _) | (_, Value::Null) => false,
+                            _ => return Err("LIKE requires text operands".to_string()),
+                        };
+                        match op {
+                            BinaryOperator::Like => matches,
+                            BinaryOperator::NotLike => !matches,
+                            _ => unreachable!(),
+                        }
+                    }
                     BinaryOperator::And => match (left_val, right_val) {
                         (Value::Integer(l), Value::Integer(r)) => l != 0 && r != 0,
                         _ => false,
@@ -1496,6 +1585,101 @@ impl<'a> Executor<'a> {
             "Table '{}' dropped successfully",
             statement.table_name
         )))
+    }
+
+    fn execute_create_index(&mut self, statement: CreateIndexStatement) -> Result<ExecutionResult, String> {
+        self.storage
+            .create_index(&statement.table_name, &statement.column_name)?;
+        Ok(ExecutionResult::Msg(format!(
+            "Index created on column '{}' of table '{}'",
+            statement.column_name, statement.table_name
+        )))
+    }
+
+    fn execute_drop_index(&mut self, statement: DropIndexStatement) -> Result<ExecutionResult, String> {
+        self.storage
+            .drop_index(&statement.table_name, &statement.column_name)?;
+        Ok(ExecutionResult::Msg(format!(
+            "Index dropped on column '{}' of table '{}'",
+            statement.column_name, statement.table_name
+        )))
+    }
+
+    fn execute_describe(&self, statement: DescribeStatement) -> Result<ExecutionResult, String> {
+        let table = self
+            .storage
+            .get_table(&statement.table_name)
+            .ok_or_else(|| format!("Table '{}' not found", statement.table_name))?;
+
+        let columns = vec!["Field".to_string(), "Type".to_string()];
+        let mut rows = Vec::new();
+
+        for column in &table.columns {
+            let type_str = match column.data_type {
+                DataType::Integer => "INTEGER",
+                DataType::Text => "TEXT",
+            };
+            rows.push(vec![Value::Text(column.name.clone()), Value::Text(type_str.to_string())]);
+        }
+
+        Ok(ExecutionResult::RowSet { columns, rows })
+    }
+
+    fn execute_show_tables(&self) -> Result<ExecutionResult, String> {
+        let columns = vec!["Tables".to_string()];
+        let table_names = self.storage.list_table_names();
+        let rows: Vec<Row> = table_names
+            .into_iter()
+            .map(|name| vec![Value::Text(name)])
+            .collect();
+
+        Ok(ExecutionResult::RowSet { columns, rows })
+    }
+
+    fn sql_like_match(text: &str, pattern: &str) -> bool {
+        let mut text_chars = text.chars().peekable();
+        let mut pattern_chars = pattern.chars().peekable();
+
+        Self::like_match_recursive(&mut text_chars, &mut pattern_chars)
+    }
+
+    fn like_match_recursive<I>(text: &mut std::iter::Peekable<I>, pattern: &mut std::iter::Peekable<I>) -> bool
+    where
+        I: Iterator<Item = char> + Clone,
+    {
+        loop {
+            match pattern.peek() {
+                None => return text.peek().is_none(),
+                Some(&'%') => {
+                    pattern.next();
+                    if pattern.peek().is_none() {
+                        return true;
+                    }
+
+                    loop {
+                        if Self::like_match_recursive(&mut text.clone(), &mut pattern.clone()) {
+                            return true;
+                        }
+                        if text.next().is_none() {
+                            return false;
+                        }
+                    }
+                }
+                Some(&'_') => {
+                    pattern.next();
+                    if text.next().is_none() {
+                        return false;
+                    }
+                }
+                Some(&p) => {
+                    pattern.next();
+                    match text.next() {
+                        Some(t) if t == p => continue,
+                        _ => return false,
+                    }
+                }
+            }
+        }
     }
 }
 

@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>SQLR Web UI Test</title>
+</head>
+<body>
+    <h1>SQLR Web UI Diagnostic Test</h1>
+    <button onclick="testHealth()">Test Health API</button>
+    <button onclick="testQuery()">Test Query API</button>
+    <div id="output" style="margin-top: 20px; padding: 10px; border: 1px solid #ccc;">
+        Results will appear here...
+    </div>
+
+    <script>
+        const output = document.getElementById('output');
+
+        async function testHealth() {
+            output.innerHTML = 'Testing health API...';
+            try {
+                const response = await fetch('/api/health');
+                const data = await response.json();
+                output.innerHTML = '<h3>Health API Response:</h3><pre>' + JSON.stringify(data, null, 2) + '</pre>';
+                console.log('Health response:', data);
+            } catch (error) {
+                output.innerHTML = '<h3 style="color: red;">Error:</h3><pre>' + error.message + '</pre>';
+                console.error('Health error:', error);
+            }
+        }
+
+        async function testQuery() {
+            output.innerHTML = 'Testing query API...';
+            try {
+                const response = await fetch('/api/query', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ query: 'SELECT 1' })
+                });
+                const data = await response.json();
+                output.innerHTML = '<h3>Query API Response:</h3><pre>' + JSON.stringify(data, null, 2) + '</pre>';
+                console.log('Query response:', data);
+            } catch (error) {
+                output.innerHTML = '<h3 style="color: red;">Error:</h3><pre>' + error.message + '</pre>';
+                console.error('Query error:', error);
+            }
+        }
+
+        // Auto-test on load
+        console.log('SQLR Web UI Test page loaded');
+        console.log('Open Firefox DevTools (F12) to see detailed logs');
+
+        window.addEventListener('load', () => {
+            console.log('Page fully loaded');
+            console.log('Testing APIs in 1 second...');
+            setTimeout(testHealth, 1000);
+        });
+    </script>
+</body>
+</html>

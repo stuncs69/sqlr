@@ -65,6 +65,18 @@ pub enum Token {
     Group,
     Having,
     Drop,
+    Like,
+    In,
+    Case,
+    When,
+    Then,
+    Else,
+    End,
+    Between,
+    Describe,
+    Show,
+    Tables,
+    Index,
 }
 
 pub struct Lexer<'a> {
@@ -211,6 +223,19 @@ impl<'a> Lexer<'a> {
             "GROUP" => Token::Group,
             "HAVING" => Token::Having,
             "DROP" => Token::Drop,
+            "LIKE" => Token::Like,
+            "IN" => Token::In,
+            "CASE" => Token::Case,
+            "WHEN" => Token::When,
+            "THEN" => Token::Then,
+            "ELSE" => Token::Else,
+            "END" => Token::End,
+            "BETWEEN" => Token::Between,
+            "DESCRIBE" => Token::Describe,
+            "DESC" if ident.to_uppercase() == "DESCRIBE" => Token::Describe,
+            "SHOW" => Token::Show,
+            "TABLES" => Token::Tables,
+            "INDEX" => Token::Index,
             _ => Token::Identifier(ident.to_string()),
         }
     }
@@ -412,6 +437,22 @@ pub enum Expression {
         name: String,
         arguments: Vec<Expression>,
     },
+    InList {
+        expr: Box<Expression>,
+        list: Vec<Expression>,
+        negated: bool,
+    },
+    Between {
+        expr: Box<Expression>,
+        low: Box<Expression>,
+        high: Box<Expression>,
+        negated: bool,
+    },
+    Case {
+        operand: Option<Box<Expression>>,
+        when_clauses: Vec<(Expression, Expression)>,
+        else_result: Option<Box<Expression>>,
+    },
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -485,10 +526,31 @@ pub enum Statement {
     Delete(DeleteStatement),
     Update(UpdateStatement),
     DropTable(DropTableStatement),
+    CreateIndex(CreateIndexStatement),
+    DropIndex(DropIndexStatement),
+    Describe(DescribeStatement),
+    ShowTables,
 }
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct DropTableStatement {
+    pub table_name: String,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct CreateIndexStatement {
+    pub table_name: String,
+    pub column_name: String,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct DropIndexStatement {
+    pub table_name: String,
+    pub column_name: String,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct DescribeStatement {
     pub table_name: String,
 }
 
@@ -525,7 +587,8 @@ pub enum BinaryOperator {
     Gt,
     LtEq,
     GtEq,
-
+    Like,
+    NotLike,
     And,
     Or,
 }
@@ -557,6 +620,9 @@ impl Token {
             | Token::GreaterThan
             | Token::LessThanOrEqual
             | Token::GreaterThanOrEqual => Precedence::LessGreater,
+            Token::Like => Precedence::Equals,
+            Token::In => Precedence::Equals,
+            Token::Between => Precedence::Equals,
             Token::And => Precedence::LogicalAnd,
             Token::Or => Precedence::LogicalOr,
             Token::Is => Precedence::Equals,
@@ -595,11 +661,13 @@ impl<'a> Parser<'a> {
     pub fn parse_program(&mut self) -> Option<Statement> {
         match self.current_token {
             Token::Select => self.parse_select_statement(),
-            Token::Create => self.parse_create_table_statement(),
+            Token::Create => self.parse_create_statement(),
             Token::Insert => self.parse_insert_statement(),
             Token::Delete => self.parse_delete_statement(),
             Token::Update => self.parse_update_statement(),
-            Token::Drop => self.parse_drop_table_statement(),
+            Token::Drop => self.parse_drop_statement(),
+            Token::Describe => self.parse_describe_statement(),
+            Token::Show => self.parse_show_statement(),
             Token::Eof => None,
             _ => {
                 self.errors.push(format!(
@@ -1019,6 +1087,7 @@ impl<'a> Parser<'a> {
             Token::LeftParen => self.parse_grouped_expression(),
             Token::Not => self.parse_prefix_unary(),
             Token::Null => Some(Expression::Literal(LiteralValue::Null)),
+            Token::Case => self.parse_case_expression(),
             Token::Asterisk => {
                 Some(Expression::QualifiedIdentifier(QualifiedIdentifier {
                     table: None,
@@ -1040,6 +1109,9 @@ impl<'a> Parser<'a> {
             | Token::And
             | Token::Or => self.parse_binary_infix(left),
             Token::Is => self.parse_is_null_infix(left),
+            Token::Like => self.parse_like_infix(left),
+            Token::In => self.parse_in_infix(left),
+            Token::Between => self.parse_between_infix(left),
 
             _ => {
                 self.errors.push(format!(
@@ -1131,6 +1203,132 @@ impl<'a> Parser<'a> {
         expr
     }
 
+    fn parse_like_infix(&mut self, left: Expression) -> Option<Expression> {
+        self.next_token();
+        let right = self.parse_expression(Precedence::Equals)?;
+        Some(Expression::BinaryOp {
+            left: Box::new(left),
+            op: BinaryOperator::Like,
+            right: Box::new(right),
+        })
+    }
+
+    fn parse_in_infix(&mut self, left: Expression) -> Option<Expression> {
+        self.next_token();
+        if !self.current_token_is(Token::LeftParen) {
+            self.errors.push("Expected '(' after IN".to_string());
+            return None;
+        }
+        self.next_token();
+
+        let mut list = Vec::new();
+        loop {
+            match self.parse_expression(Precedence::Lowest) {
+                Some(expr) => list.push(expr),
+                None => {
+                    self.errors.push("Expected expression in IN list".to_string());
+                    return None;
+                }
+            }
+
+            self.next_token();
+            if self.current_token_is(Token::RightParen) {
+                break;
+            }
+            if !self.current_token_is(Token::Comma) {
+                self.errors.push("Expected ',' or ')' in IN list".to_string());
+                return None;
+            }
+            self.next_token();
+        }
+
+        Some(Expression::InList {
+            expr: Box::new(left),
+            list,
+            negated: false,
+        })
+    }
+
+    fn parse_between_infix(&mut self, left: Expression) -> Option<Expression> {
+        self.next_token();
+        let low = self.parse_expression(Precedence::Lowest)?;
+
+        if !self.peek_token_is(Token::And) {
+            self.errors.push("Expected AND in BETWEEN expression".to_string());
+            return None;
+        }
+        self.next_token();
+        self.next_token();
+
+        let high = self.parse_expression(Precedence::Lowest)?;
+
+        Some(Expression::Between {
+            expr: Box::new(left),
+            low: Box::new(low),
+            high: Box::new(high),
+            negated: false,
+        })
+    }
+
+    fn parse_case_expression(&mut self) -> Option<Expression> {
+        self.next_token();
+
+        // Check if this is a simple CASE (with operand) or searched CASE
+        let operand = if !self.current_token_is(Token::When) {
+            let op = self.parse_expression(Precedence::Lowest)?;
+            self.next_token(); // Move past the operand expression
+            Some(Box::new(op))
+        } else {
+            None
+        };
+
+        let mut when_clauses = Vec::new();
+
+        loop {
+            if !self.current_token_is(Token::When) {
+                break;
+            }
+            self.next_token();
+
+            let condition = self.parse_expression(Precedence::Lowest)?;
+            self.next_token(); // Move past the condition
+
+            if !self.current_token_is(Token::Then) {
+                self.errors.push("Expected THEN after WHEN condition".to_string());
+                return None;
+            }
+            self.next_token();
+
+            let result = self.parse_expression(Precedence::Lowest)?;
+            when_clauses.push((condition, result));
+
+            self.next_token(); // Move to next token after result
+        }
+
+        let else_result = if self.current_token_is(Token::Else) {
+            self.next_token();
+            let result = self.parse_expression(Precedence::Lowest)?;
+            self.next_token(); // Move past the else expression
+            Some(Box::new(result))
+        } else {
+            None
+        };
+
+        if !self.current_token_is(Token::End) {
+            self.errors.push(format!(
+                "Expected END to close CASE expression, found {:?}",
+                self.current_token
+            ));
+            return None;
+        }
+
+        Some(Expression::Case {
+            operand,
+            when_clauses,
+            else_result,
+        })
+    }
+
     fn peek_token_is(&self, expected: Token) -> bool {
         self.peek_token == expected
     }
@@ -1161,12 +1359,23 @@ impl<'a> Parser<'a> {
         &self.errors
     }
 
-    fn parse_create_table_statement(&mut self) -> Option<Statement> {
-        if !self.peek_token_is(Token::Table) {
-            self.peek_error_current(Token::Table);
-            return None;
-        }
+    fn parse_create_statement(&mut self) -> Option<Statement> {
         self.next_token();
+
+        if self.current_token_is(Token::Table) {
+            return self.parse_create_table_statement();
+        } else if self.current_token_is(Token::Index) {
+            return self.parse_create_index_statement();
+        } else {
+            self.errors.push(format!(
+                "Expected TABLE or INDEX after CREATE, found {:?}",
+                self.current_token
+            ));
+            None
+        }
+    }
+
+    fn parse_create_table_statement(&mut self) -> Option<Statement> {
         self.next_token();
 
         let table_name = match &self.current_token {
@@ -1585,12 +1794,23 @@ impl<'a> Parser<'a> {
         Ok(FromClause { base_table, joins })
     }
 
-    fn parse_drop_table_statement(&mut self) -> Option<Statement> {
-        if !self.peek_token_is(Token::Table) {
-            self.peek_error_current(Token::Table);
-            return None;
-        }
+    fn parse_drop_statement(&mut self) -> Option<Statement> {
         self.next_token();
+
+        if self.current_token_is(Token::Table) {
+            return self.parse_drop_table_statement();
+        } else if self.current_token_is(Token::Index) {
+            return self.parse_drop_index_statement();
+        } else {
+            self.errors.push(format!(
+                "Expected TABLE or INDEX after DROP, found {:?}",
+                self.current_token
+            ));
+            None
+        }
+    }
+
+    fn parse_drop_table_statement(&mut self) -> Option<Statement> {
         self.next_token();
 
         let table_name = match &self.current_token {
@@ -1607,6 +1827,138 @@ impl<'a> Parser<'a> {
         }
 
         Some(Statement::DropTable(DropTableStatement { table_name }))
+    }
+
+    fn parse_create_index_statement(&mut self) -> Option<Statement> {
+        self.next_token();
+
+        let index_name_or_table = match &self.current_token {
+            Token::Identifier(name) => name.clone(),
+            _ => {
+                self.errors.push("Expected index/table name after CREATE INDEX".to_string());
+                return None;
+            }
+        };
+        self.next_token();
+
+        // Expect ON keyword
+        if !self.current_token_is(Token::On) {
+            self.errors.push("Expected ON after index name".to_string());
+            return None;
+        }
+        self.next_token();
+
+        let table_name = match &self.current_token {
+            Token::Identifier(name) => name.clone(),
+            _ => {
+                self.errors.push("Expected table name after ON".to_string());
+                return None;
+            }
+        };
+        self.next_token();
+
+        // Expect column name in parentheses
+        if !self.current_token_is(Token::LeftParen) {
+            self.errors.push("Expected '(' after table name".to_string());
+            return None;
+        }
+        self.next_token();
+
+        let column_name = match &self.current_token {
+            Token::Identifier(name) => name.clone(),
+            _ => {
+                self.errors.push("Expected column name in CREATE INDEX".to_string());
+                return None;
+            }
+        };
+        self.next_token();
+
+        if !self.current_token_is(Token::RightParen) {
+            self.errors.push("Expected ')' after column name".to_string());
+            return None;
+        }
+        self.next_token();
+
+        if self.current_token_is(Token::Semicolon) {
+            self.next_token();
+        }
+
+        Some(Statement::CreateIndex(CreateIndexStatement {
+            table_name,
+            column_name,
+        }))
+    }
+
+    fn parse_drop_index_statement(&mut self) -> Option<Statement> {
+        self.next_token();
+
+        let index_name = match &self.current_token {
+            Token::Identifier(name) => name.clone(),
+            _ => {
+                self.errors.push("Expected index name after DROP INDEX".to_string());
+                return None;
+            }
+        };
+        self.next_token();
+
+        if !self.current_token_is(Token::On) {
+            self.errors.push("Expected ON after index name in DROP INDEX".to_string());
+            return None;
+        }
+        self.next_token();
+
+        let table_name = match &self.current_token {
+            Token::Identifier(name) => name.clone(),
+            _ => {
+                self.errors.push("Expected table name after ON in DROP INDEX".to_string());
+                return None;
+            }
+        };
+        self.next_token();
+
+        if self.current_token_is(Token::Semicolon) {
+            self.next_token();
+        }
+
+        Some(Statement::DropIndex(DropIndexStatement {
+            table_name,
+            column_name: index_name,
+        }))
+    }
+
+    fn parse_describe_statement(&mut self) -> Option<Statement> {
+        self.next_token();
+
+        let table_name = match &self.current_token {
+            Token::Identifier(name) => name.clone(),
+            _ => {
+                self.errors.push("Expected table name after DESCRIBE".to_string());
+                return None;
+            }
+        };
+        self.next_token();
+
+        if self.current_token_is(Token::Semicolon) {
+            self.next_token();
+        }
+
+        Some(Statement::Describe(DescribeStatement { table_name }))
+    }
+
+    fn parse_show_statement(&mut self) -> Option<Statement> {
+        self.next_token();
+
+        if !self.current_token_is(Token::Tables) {
+            self.errors.push("Expected TABLES after SHOW".to_string());
+            return None;
+        }
+        self.next_token();
+
+        if self.current_token_is(Token::Semicolon) {
+            self.next_token();
+        }
+
+        Some(Statement::ShowTables)
     }
 }
 
